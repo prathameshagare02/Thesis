@@ -1,0 +1,585 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from ultralytics import SAM
+import torch
+from sklearn.cluster import KMeans  # for unsupervised rust classification
+
+
+class MetalSegmenter:
+    def __init__(self):
+        self.image = None
+        self.original_image = None
+        self.mask = None               # raw segmentation mask (metal = 1)
+        self.processed_mask = None     # mask after morphology
+        self.model = None
+        self.image_path = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # morphology parameters
+        self.kernel_size = 5
+        self.erosion_iterations = 1
+        self.dilation_iterations = 1
+
+        # rust output
+        self.rust_mask = None
+        self.rust_percentage = None
+
+        print(f"Using device: {self.device}")
+        self.load_sam2_model()
+
+    # ------------------------------------------------------------------
+    # MODEL / IMAGE LOADING
+    # ------------------------------------------------------------------
+    def load_sam2_model(self):
+        """Load SAM 2 model from Ultralytics."""
+        try:
+            print("Loading SAM 2 model...")
+            self.model = SAM("sam2.1_b.pt")
+            print("SAM 2 model loaded successfully!")
+            return True
+        except Exception as e:
+            print(f"Error loading SAM 2 model: {e}")
+            messagebox.showerror("Error", f"Failed to load SAM 2 model: {e}")
+            return False
+
+    def load_image(self, image_path=None):
+        """Load an image from file (using file dialog if path not given)."""
+        if image_path is None:
+            root = tk.Tk()
+            root.withdraw()
+            image_path = filedialog.askopenfilename(
+                title="Select metal object image",
+                filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.tiff")],
+            )
+            root.destroy()
+
+        if not image_path:
+            return False
+
+        self.image = cv2.imread(image_path)
+        if self.image is None:
+            messagebox.showerror("Error", "Could not load image!")
+            return False
+
+        self.image_path = image_path
+        self.original_image = self.image.copy()
+        print(f"Image loaded: {self.image.shape}")
+        return True
+
+    # ------------------------------------------------------------------
+    # BASIC MORPHOLOGY
+    # ------------------------------------------------------------------
+    def apply_morphological_operations(self, mask):
+        """Apply erosion and dilation operations to the mask (internal use)."""
+        if mask is None:
+            return None
+
+        mask_uint8 = (mask * 255).astype(np.uint8)
+        kernel = np.ones((self.kernel_size, self.kernel_size), np.uint8)
+
+        if self.erosion_iterations > 0:
+            mask_eroded = cv2.erode(mask_uint8, kernel, iterations=self.erosion_iterations)
+        else:
+            mask_eroded = mask_uint8.copy()
+
+        if self.dilation_iterations > 0:
+            mask_dilated = cv2.dilate(mask_eroded, kernel, iterations=self.dilation_iterations)
+        else:
+            mask_dilated = mask_eroded.copy()
+
+        processed_mask = (mask_dilated > 127).astype(np.uint8)
+        return processed_mask
+
+    # ------------------------------------------------------------------
+    # RUST (CORROSION) CLASSIFICATION
+    # ------------------------------------------------------------------
+    def rust_zero_shot_classification(self, n_clusters=2):
+        """
+        Unsupervised rust classification on the metal region ONLY.
+        """
+        if self.original_image is None:
+            print("No image loaded for rust detection.")
+            return None, None
+
+        mask_to_use = self.processed_mask if self.processed_mask is not None else self.mask
+        if mask_to_use is None:
+            print("No mask available for rust detection.")
+            return None, None
+
+        # >>> IMPORTANT: we only use pixels where mask == 1  (metal region)
+        ys, xs = np.where(mask_to_use == 1)
+        if len(xs) < n_clusters:
+            print("Not enough metal pixels for clustering.")
+            return None, None
+
+        img_bgr = self.original_image
+        hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+        H, S, V = cv2.split(hsv)
+
+        # feature matrix [N,3]
+        features = np.stack(
+            [
+                H[ys, xs].astype(np.float32),
+                S[ys, xs].astype(np.float32),
+                V[ys, xs].astype(np.float32),
+            ],
+            axis=1,
+        )
+
+        mean = features.mean(axis=0, keepdims=True)
+        std = features.std(axis=0, keepdims=True) + 1e-6
+        features_norm = (features - mean) / std
+
+        try:
+            kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init=10)
+            cluster_labels = kmeans.fit_predict(features_norm)
+        except Exception as e:
+            print(f"KMeans rust error: {e}")
+            return None, None
+
+        # compute simple rust score per cluster
+        rust_scores = []
+        for k in range(n_clusters):
+            mask_k = cluster_labels == k
+            if not np.any(mask_k):
+                rust_scores.append(-1e9)
+                continue
+
+            H_mean = H[ys[mask_k], xs[mask_k]].astype(np.float32).mean()
+            S_mean = S[ys[mask_k], xs[mask_k]].astype(np.float32).mean()
+            V_mean = V[ys[mask_k], xs[mask_k]].astype(np.float32).mean()
+
+            hue_center = 10.0  # reddish/orange
+            hue_penalty = abs(H_mean - hue_center) / 90.0
+            rust_score = (S_mean / 255.0) - hue_penalty - (V_mean / 255.0 * 0.2)
+            rust_scores.append(rust_score)
+
+        rust_cluster = int(np.argmax(rust_scores))
+
+        rust_mask = np.zeros_like(mask_to_use, dtype=np.uint8)
+        rust_points = cluster_labels == rust_cluster
+        rust_mask[ys[rust_points], xs[rust_points]] = 1
+
+        total_metal_pixels = len(xs)              # only metal pixels
+        rust_pixels = rust_points.sum()
+        rust_percentage = rust_pixels / total_metal_pixels * 100.0
+
+        return rust_mask, rust_percentage
+
+    def show_rust_results(self):
+        """Show ONLY the final 3-panel rust figure."""
+        if self.rust_mask is None:
+            print("No rust mask to display.")
+            return
+
+        img_rgb = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2RGB)
+        metal_mask = self.processed_mask if self.processed_mask is not None else self.mask
+
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+        fig.suptitle("Rust Classification (Zero-Shot) on Metal Region",
+                     fontsize=16, fontweight="bold")
+
+        # 1) Original image
+        axes[0].imshow(img_rgb)
+        axes[0].set_title("Original Image", fontweight="bold")
+        axes[0].axis("off")
+
+        # 2) Metal-only region (background black)
+        metal_only = img_rgb.copy()
+        metal_only[metal_mask == 0] = 0
+        axes[1].imshow(metal_only)
+        axes[1].set_title("Metal Region", fontweight="bold")
+        axes[1].axis("off")
+
+        # 3) Rust overlay ON METAL REGION ONLY  (what you asked for)
+        base = metal_only.copy()                     # start from metal-only
+        overlay = base.copy()
+        overlay[self.rust_mask == 1] = [255, 0, 0]   # red rust on metal
+        blended = cv2.addWeighted(base, 0.7, overlay, 0.3, 0)
+
+        title = "Rust Areas (Red)"
+        if self.rust_percentage is not None:
+            title += f"\nEstimated Corrosion: {self.rust_percentage:.2f}% of metal"
+        axes[2].imshow(blended)
+        axes[2].set_title(title, fontweight="bold")
+        axes[2].axis("off")
+
+        plt.tight_layout()
+        plt.show()
+
+        if self.rust_percentage is not None:
+            print(f"Estimated rust / corrosion: {self.rust_percentage:.2f}% of metal region.")
+
+    def run_rust_classification(self):
+        """Run rust classification and show only the final figure."""
+        if self.original_image is None:
+            print("No image loaded; cannot run rust classification.")
+            return
+        if self.processed_mask is None and self.mask is None:
+            print("No mask available; run segmentation first.")
+            return
+
+        self.rust_mask, self.rust_percentage = self.rust_zero_shot_classification()
+        if self.rust_mask is not None:
+            self.show_rust_results()
+        else:
+            print("Rust classification failed or skipped.")
+
+    # ------------------------------------------------------------------
+    # SEGMENTATION PIPELINE
+    # ------------------------------------------------------------------
+    def detect_metal_regions(self):
+        """Automatically detect metal-like regions based on visual properties."""
+        if self.image is None:
+            return []
+        try:
+            gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
+            hsv = cv2.cvtColor(self.image, cv2.COLOR_BGR2HSV)
+            lab = cv2.cvtColor(self.image, cv2.COLOR_BGR2LAB)
+
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            edges = cv2.Canny(blurred, 50, 150)
+
+            _, A, _ = cv2.split(lab)
+            metal_mask1 = cv2.inRange(A, 120, 135)
+
+            _, S, V = cv2.split(hsv)
+            metal_mask2 = cv2.inRange(S, 30, 100) & cv2.inRange(V, 100, 255)
+
+            kernel = np.ones((3, 3), np.uint8)
+            edges_dilated = cv2.dilate(edges, kernel, iterations=2)
+
+            combined_metal = cv2.bitwise_or(metal_mask1, metal_mask2)
+            combined_metal = cv2.bitwise_or(combined_metal, edges_dilated)
+            combined_metal = cv2.morphologyEx(combined_metal, cv2.MORPH_CLOSE, kernel)
+            combined_metal = cv2.morphologyEx(combined_metal, cv2.MORPH_OPEN, kernel)
+
+            contours, _ = cv2.findContours(combined_metal, cv2.RETR_EXTERNAL,
+                                           cv2.CHAIN_APPROX_SIMPLE)
+
+            regions = []
+            min_area = 500
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area > min_area:
+                    x, y, w, h = cv2.boundingRect(contour)
+                    center_x = x + w // 2
+                    center_y = y + h // 2
+                    regions.append(
+                        {
+                            "id": len(regions),
+                            "bbox": [x, y, x + w, y + h],
+                            "center": [center_x, center_y],
+                            "area": area,
+                        }
+                    )
+            return regions
+        except Exception as e:
+            print(f"Metal detection error: {e}")
+            return []
+
+    def sam2_predict(self, points, labels):
+        """Predict segmentation mask using SAM 2, then apply morphology."""
+        if self.model is None:
+            messagebox.showerror("Error", "SAM 2 model not loaded!")
+            return None
+        try:
+            image_rgb = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2RGB)
+            results = self.model.predict(image_rgb, points=points, labels=labels)
+            if (
+                results
+                and len(results) > 0
+                and results[0].masks is not None
+                and len(results[0].masks.data) > 0
+            ):
+                mask = results[0].masks.data[0].cpu().numpy()
+                binary_mask = (mask > 0.5).astype(np.uint8)
+                self.processed_mask = self.apply_morphological_operations(binary_mask)
+                return binary_mask
+            return None
+        except Exception as e:
+            print(f"SAM 2 prediction error: {e}")
+            return self.fallback_segmentation(points, labels)
+
+    def fallback_segmentation(self, points, labels):
+        """Fallback segmentation using GrabCut if SAM fails."""
+        if len(points) == 0:
+            mask = np.zeros(self.original_image.shape[:2], dtype=np.uint8)
+            self.processed_mask = mask.copy()
+            return mask
+
+        mask = np.zeros(self.original_image.shape[:2], dtype=np.uint8)
+        for point, label in zip(points, labels):
+            x, y = point
+            if label == 1:  # foreground
+                cv2.circle(mask, (x, y), 15, 3, -1)
+            else:  # background
+                cv2.circle(mask, (x, y), 15, 0, -1)
+
+        bgd_model = np.zeros((1, 65), np.float64)
+        fgd_model = np.zeros((1, 65), np.float64)
+
+        if any(l == 1 for l in labels):
+            fg_points = [points[i] for i in range(len(points)) if labels[i] == 1]
+            x_coords = [p[0] for p in fg_points]
+            y_coords = [p[1] for p in fg_points]
+            x1 = max(0, min(x_coords) - 30)
+            x2 = min(self.image.shape[1], max(x_coords) + 30)
+            y1 = max(0, min(y_coords) - 30)
+            y2 = min(self.image.shape[0], max(y_coords) + 30)
+            rect = (x1, y1, x2 - x1, y2 - y1)
+
+            cv2.grabCut(
+                self.original_image,
+                mask,
+                rect,
+                bgd_model,
+                fgd_model,
+                5,
+                cv2.GC_INIT_WITH_RECT,
+            )
+
+        final_mask = np.where((mask == 2) | (mask == 0), 0, 1).astype(np.uint8)
+        self.processed_mask = self.apply_morphological_operations(final_mask)
+        return final_mask
+
+    def interactive_metal_segmentation(self):
+        """Main interactive segmentation for metal objects."""
+        if self.image is None:
+            messagebox.showerror("Error", "Please load an image first!")
+            return False
+
+        print("Detecting metal regions...")
+        regions = self.detect_metal_regions()
+        if regions:
+            print(
+                f"Found {len(regions)} potential metal regions - using auto-detection mode"
+            )
+            return self.auto_detection_mode(regions)
+        else:
+            print("No metal regions auto-detected - using manual point mode")
+            return self.manual_point_mode()
+
+    def auto_detection_mode(self, regions):
+        """Auto-detection mode where user clicks on detected metal regions."""
+        cv2.namedWindow("Click on METAL Parts - Press 's' when done")
+
+        def click_callback(event, x, y, flags, param):
+            regions_param = param["regions"]
+            if event == cv2.EVENT_LBUTTONDOWN:
+                for region in regions_param:
+                    x1, y1, x2, y2 = map(int, region["bbox"])
+                    if x1 <= x <= x2 and y1 <= y <= y2:
+                        print(f"Selected metal region {region['id']}")
+                        center_x, center_y = region["center"]
+                        self.mask = self.sam2_predict(
+                            points=[[center_x, center_y]], labels=[1]
+                        )
+                        self.update_auto_display(regions_param, region["id"])
+                        break
+
+        self.update_auto_display(regions, -1)
+        param = {"regions": regions}
+        cv2.setMouseCallback(
+            "Click on METAL Parts - Press 's' when done", click_callback, param
+        )
+
+        while True:
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("m"):
+                cv2.destroyAllWindows()
+                return self.manual_point_mode()
+            elif key == ord("s"):
+                if self.mask is not None and np.any(self.mask):
+                    cv2.destroyAllWindows()
+                    return True
+                else:
+                    messagebox.showwarning(
+                        "No Selection", "Please select a metal region first!"
+                    )
+            elif key == ord("q"):
+                cv2.destroyAllWindows()
+                return False
+
+    def update_auto_display(self, regions, selected_id):
+        """Update display for auto-detection mode (OpenCV only)."""
+        display_image = self.original_image.copy()
+        for region in regions:
+            x1, y1, x2, y2 = map(int, region["bbox"])
+            center_x, center_y = map(int, region["center"])
+            if region["id"] == selected_id:
+                color = (0, 255, 0)
+                thickness = 3
+                if self.mask is not None and np.any(self.mask):
+                    overlay = display_image.copy()
+                    overlay[self.mask == 1] = [0, 255, 0]
+                    display_image = cv2.addWeighted(
+                        display_image, 0.7, overlay, 0.3, 0
+                    )
+            else:
+                color = (255, 0, 0)
+                thickness = 2
+
+            cv2.rectangle(display_image, (x1, y1), (x2, y2), color, thickness)
+            cv2.putText(
+                display_image,
+                f"M{region['id']}",
+                (center_x, center_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 255, 255),
+                3,
+            )
+            cv2.putText(
+                display_image,
+                f"M{region['id']}",
+                (center_x, center_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                color,
+                2,
+            )
+
+        instructions = [
+            "METAL DETECTION MODE",
+            f"Found {len(regions)} potential metal regions",
+            "Click on any METAL REGION (M0, M1, etc.) to select it",
+            "Green = Selected metal, Blue = Potential metal",
+            "Press 'm' for manual mode, 's' to save selection, 'q' to quit",
+        ]
+        for i, instruction in enumerate(instructions):
+            cv2.putText(
+                display_image,
+                instruction,
+                (10, 30 + i * 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 0),
+                3,
+            )
+            cv2.putText(
+                display_image,
+                instruction,
+                (10, 30 + i * 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                1,
+            )
+
+        cv2.imshow("Click on METAL Parts - Press 's' when done", display_image)
+
+    def manual_point_mode(self):
+        """Manual point-based segmentation for metal objects."""
+        print("Manual metal segmentation mode")
+        cv2.namedWindow("Click on METAL Objects - Press 's' when done")
+        points, labels = [], []
+
+        def click_callback(event, x, y, flags, param):
+            if event == cv2.EVENT_LBUTTONDOWN:
+                points.append([x, y])
+                labels.append(1)
+                print(f"Added metal point at ({x}, {y})")
+                self.mask = self.sam2_predict(points, labels)
+                self.update_manual_display(points)
+
+        cv2.setMouseCallback(
+            "Click on METAL Objects - Press 's' when done", click_callback
+        )
+        self.update_manual_display(points)
+
+        while True:
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("c"):
+                points.clear()
+                labels.clear()
+                self.mask = np.zeros(self.image.shape[:2], dtype=np.uint8)
+                self.processed_mask = np.zeros(self.image.shape[:2], dtype=np.uint8)
+                self.update_manual_display(points)
+                print("Cleared all points")
+            elif key == ord("s"):
+                if points:
+                    cv2.destroyAllWindows()
+                    return True
+                else:
+                    messagebox.showwarning(
+                        "No Points", "Please click on metal areas first!"
+                    )
+            elif key == ord("q"):
+                cv2.destroyAllWindows()
+                return False
+
+    def update_manual_display(self, points):
+        """Update display for manual point mode (OpenCV only)."""
+        display_image = self.original_image.copy()
+        for x, y in points:
+            cv2.circle(display_image, (x, y), 8, (0, 255, 0), -1)
+            cv2.circle(display_image, (x, y), 10, (255, 255, 255), 2)
+
+        if self.mask is not None and np.any(self.mask):
+            overlay = display_image.copy()
+            overlay[self.mask == 1] = [0, 255, 0]
+            display_image = cv2.addWeighted(display_image, 0.7, overlay, 0.3, 0)
+
+        instructions = [
+            "MANUAL METAL SEGMENTATION",
+            "Click on METAL objects to segment them",
+            "Green circles = Your clicks, Green overlay = Detected metal",
+            "Press 'c' to clear points, 's' to save selection, 'q' to quit",
+        ]
+        for i, instruction in enumerate(instructions):
+            cv2.putText(
+                display_image,
+                instruction,
+                (10, 30 + i * 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 0),
+                3,
+            )
+            cv2.putText(
+                display_image,
+                instruction,
+                (10, 30 + i * 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                1,
+            )
+
+        cv2.imshow("Click on METAL Objects - Press 's' when done", display_image)
+
+    # ------------------------------------------------------------------
+    # FINAL STEP WRAPPERS
+    # ------------------------------------------------------------------
+    def show_results(self):
+        """Only show the final rust classification figure."""
+        if self.image is None or self.mask is None:
+            messagebox.showwarning("No Results", "No segmentation results to display.")
+            return
+
+        if self.processed_mask is None:
+            self.processed_mask = self.apply_morphological_operations(self.mask)
+
+        self.run_rust_classification()
+
+    def run(self):
+        """Main workflow."""
+        print("METAL OBJECT SEGMENTATION + RUST CLASSIFICATION TOOL")
+        print("=" * 60)
+        if not self.load_image():
+            return
+        if not self.interactive_metal_segmentation():
+            return
+        self.show_results()
+        print(
+            "Metal object segmentation and rust percentage estimation completed."
+        )
+
+
+if __name__ == "__main__":
+    segmenter = MetalSegmenter()
+    segmenter.run()
