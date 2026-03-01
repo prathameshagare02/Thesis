@@ -9,7 +9,7 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy import ndimage
-from skimage.segmentation import mark_boundaries, slic
+from skimage.segmentation import slic
 from skimage.util import img_as_float
 from ultralytics import SAM
 
@@ -58,19 +58,18 @@ def pick_image_file(
 class FastRustDetector:
     """
     Per-segment feature vectors:
-      - Each SLIC segment == one feature vector (your "one cluster -> one vector").
+      - Each SLIC segment == one feature vector.
       - Each feature vector is classified rust/no-rust.
 
     Dynamic thresholds:
-      - Dynamic feature gates (Option A): derive feature cutoffs from percentiles of METAL segments in the image.
-      - Dynamic score threshold (Option B): derive final score cutoff from Otsu over rust_scores (metal segments).
+      - Dynamic feature gates: derive feature cutoffs from percentiles of METAL segments in the image.
+      - Dynamic score threshold: derive final score cutoff from Otsu over rust_scores (metal segments).
 
-    Updates in this version:
-      1) "Metal Input" visualization is tightly cropped to the metal mask bbox, with NO black background.
-      2) Dark brown / near-black rust is more likely to classify as rust:
-         - relaxed warm-veto for very dark segments
-         - stronger "dark rust" allowance
-         - slightly more permissive Otsu threshold (biased lower + wider clamp)
+    NOTE:
+      - Red plastic exclusion logic removed.
+      - Visualization updated: ONLY shows:
+          (1) Metal Input (tight crop, non-metal -> white)
+          (2) Final Detection Result (Rust=Red)
     """
 
     def __init__(
@@ -79,16 +78,12 @@ class FastRustDetector:
         fast_mode: bool = False,
         verbose: bool = True,
         sam_checkpoint: str = "sam2.1_b.pt",
-        # Fallback / default behavior:
         rust_threshold_fallback: float = 0.60,
         ensure_one_positive: bool = True,
-        # Dynamic behavior toggles:
         dynamic_feature_gates: bool = True,
         dynamic_score_threshold: bool = True,
-        # Safety knobs:
         min_valid_segments_for_dynamic: int = 20,
-        # Otsu bias (negative makes it more inclusive):
-        otsu_bias: float = -0.05,
+        otsu_bias: float = -0.02,
     ):
         self.n_segments = int(n_segments)
         self.fast_mode = bool(fast_mode)
@@ -204,36 +199,8 @@ class FastRustDetector:
             self._log(f"Metal detection error: {e}")
             return []
 
-    def _get_red_plastic_mask_and_points(self, image: np.ndarray, max_points: int = 60):
-        """Bright red plastic -> negative points for SAM + hard exclusion mask."""
-        try:
-            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-            l1, u1 = np.array([0, 140, 100]), np.array([8, 255, 255])
-            l2, u2 = np.array([172, 140, 100]), np.array([180, 255, 255])
-
-            m1 = cv2.inRange(hsv, l1, u1)
-            m2 = cv2.inRange(hsv, l2, u2)
-            plastic_mask = cv2.bitwise_or(m1, m2)
-
-            plastic_mask = cv2.morphologyEx(plastic_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-            plastic_mask = cv2.morphologyEx(plastic_mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
-
-            inner_mask = cv2.erode(plastic_mask, np.ones((9, 9), np.uint8), iterations=1)
-            y_idxs, x_idxs = np.where(inner_mask > 0)
-
-            neg_pts, neg_lbls = [], []
-            if len(x_idxs) > 0:
-                count = len(x_idxs)
-                idxs = np.linspace(0, count - 1, max_points, dtype=int) if count > max_points else np.arange(count)
-                for i in idxs:
-                    neg_pts.append([float(x_idxs[i]), float(y_idxs[i])])
-                    neg_lbls.append(0)
-
-            return plastic_mask, neg_pts, neg_lbls
-        except Exception:
-            return None, [], []
-
     def sam2_predict(self, points: List[List[float]], labels: List[int], image: np.ndarray | None = None):
+        """SAM2 prediction using only provided points/labels (no red plastic logic)."""
         from tkinter import messagebox
 
         if self.sam_model is None:
@@ -245,21 +212,12 @@ class FastRustDetector:
             return None
 
         try:
-            plastic_mask, neg_pts, neg_lbls = self._get_red_plastic_mask_and_points(target_img)
-
-            final_points = list(points) + neg_pts
-            final_labels = list(labels) + neg_lbls
-
             image_rgb = cv2.cvtColor(target_img, cv2.COLOR_BGR2RGB)
-            results = self.sam_model.predict(image_rgb, points=final_points, labels=final_labels)
+            results = self.sam_model.predict(image_rgb, points=list(points), labels=list(labels))
 
             if results and results[0].masks is not None and len(results[0].masks.data) > 0:
                 mask = results[0].masks.data[0].cpu().numpy()
                 binary_mask = (mask > 0.5).astype(np.uint8)
-
-                # hard exclude plastic
-                if plastic_mask is not None:
-                    binary_mask[plastic_mask > 0] = 0
 
                 self.processed_mask = self.apply_morphological_operations(binary_mask)
                 return binary_mask
@@ -395,12 +353,6 @@ class FastRustDetector:
     def _extract_features_vectorized(
         self, feature_maps: Dict[str, np.ndarray], segments: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Returns:
-          features: (n_seg, 15) per-segment feature vectors (ONE vector per segment)
-          segment_ids: the actual segment labels in order
-          metal_scores: per-segment mean of metal_mask (for gating)
-        """
         unique_segments = np.unique(segments)
         n_seg = len(unique_segments)
         features = np.zeros((n_seg, 15), dtype=np.float32)
@@ -454,10 +406,6 @@ class FastRustDetector:
         return float(np.percentile(vals, q))
 
     def _compute_dynamic_gates(self, features_valid: np.ndarray) -> Dict[str, float]:
-        """
-        Derive dynamic gates from the image itself (metal-only segments).
-        Uses percentiles; falls back to the classic constants if data is scarce.
-        """
         a_vals = features_valid[:, 1] if features_valid.size else np.array([])
         b_vals = features_valid[:, 2] if features_valid.size else np.array([])
         s_vals = features_valid[:, 13] if features_valid.size else np.array([])
@@ -466,14 +414,14 @@ class FastRustDetector:
         ent_vals = features_valid[:, 7] if features_valid.size else np.array([])
 
         dyn = {
-            "a_warm": self._robust_percentile(a_vals, 55, 126.0),
-            "b_warm": self._robust_percentile(b_vals, 55, 124.0),
-            "a_red": self._robust_percentile(a_vals, 80, 145.0),
-            "a_red_hi": self._robust_percentile(a_vals, 90, 155.0),
-            "b_orange": self._robust_percentile(b_vals, 75, 140.0),
-            "b_orange_hi": self._robust_percentile(b_vals, 85, 150.0),
-            "v_dark": self._robust_percentile(v_vals, 10, 160.0),
-            "v_very_dark": self._robust_percentile(v_vals, 5, 55.0),
+            "a_warm": self._robust_percentile(a_vals, 35, 126.0),
+            "b_warm": self._robust_percentile(b_vals, 35, 124.0),
+            "a_red": self._robust_percentile(a_vals, 65, 140.0),
+            "a_red_hi": self._robust_percentile(a_vals, 75, 150.0),
+            "b_orange": self._robust_percentile(b_vals, 60, 135.0),
+            "b_orange_hi": self._robust_percentile(b_vals, 70, 145.0),
+            "v_dark": self._robust_percentile(v_vals, 20, 155.0),
+            "v_very_dark": self._robust_percentile(v_vals, 10, 55.0),
             "v_hi": self._robust_percentile(v_vals, 95, 240.0),
             "s_low": self._robust_percentile(s_vals, 25, 35.0),
             "s_mid": self._robust_percentile(s_vals, 50, 45.0),
@@ -504,15 +452,12 @@ class FastRustDetector:
         return dyn
 
     def _compute_dynamic_score_threshold_otsu(self, rust_scores_valid: np.ndarray) -> float:
-        """
-        Otsu threshold on rust_scores (0..1) for metal segments.
-        Slightly biased lower to include darker/brown rust.
-        """
         scores = rust_scores_valid[np.isfinite(rust_scores_valid)]
         if scores.size < self.min_valid_segments_for_dynamic:
             return float(self.rust_threshold_fallback)
 
         s255 = np.clip(scores * 255.0, 0, 255).astype(np.uint8)
+        # because OpenCV’s Otsu works on 0–255 like grayscale images.
 
         if int(s255.max()) - int(s255.min()) < 5:
             return float(self.rust_threshold_fallback)
@@ -520,7 +465,6 @@ class FastRustDetector:
         t, _ = cv2.threshold(s255, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         thr = float(t) / 255.0
 
-        # Bias + clamp (more permissive than before)
         thr = float(thr + self.otsu_bias)
         thr = float(np.clip(thr, 0.25, 0.75))
         return thr
@@ -553,44 +497,39 @@ class FastRustDetector:
                 "ent_hi": 10.0,
             }
 
-        # ---------------- Stage 0: stronger dark-rust allowance ----------------
-        # If very dark, allow rust with texture OR just "not-cold" b* (brownish) even if a* is low.
-        very_dark_gate = max(dyn["v_very_dark"], 70.0)  # helps for your dark brown/black
+        very_dark_gate = max(dyn["v_very_dark"], 70.0)
         is_very_dark = (mean_v < very_dark_gate)
 
         textured_enough = (mean_rough > dyn["rough_hi"] * 0.75) or (mean_ent > dyn["ent_hi"] * 0.75)
-        brownish_enough = (mean_b > (dyn["b_warm"] - 6.0))  # allow darker browns
+        brownish_enough = (mean_b > (dyn["b_warm"] - 6.0))
 
         if is_very_dark and (textured_enough or brownish_enough):
             return 0.82
 
-        # ---------------- Stage 1: vetoes (relaxed for dark segments) ----------------
         if mean_v > dyn["v_hi"]:
             return 0.0
 
-        # Warm gate: for dark segments, relax the warm requirement (black/brown rust can have lower a*)
         dark_relax = mean_v < (dyn["v_dark"] * 0.65)
         a_min = dyn["a_warm"] - (14.0 if dark_relax else 0.0)
         b_min = dyn["b_warm"] - (14.0 if dark_relax else 0.0)
         if mean_a < a_min or mean_b < b_min:
             return 0.0
 
-        # Brown rust can be low S; only veto very low S if not red enough and not dark.
-        if (mean_s < dyn["s_low"]) and (mean_a < (dyn["a_red"] - (10.0 if dark_relax else 0.0))) and (mean_v > (dyn["v_dark"] * 0.55)):
+        if (mean_s < dyn["s_low"]) and (mean_a < (dyn["a_red"] - (10.0 if dark_relax else 0.0))) and (
+            mean_v > (dyn["v_dark"] * 0.55)
+        ):
             return 0.0
 
-        # Yellow/brass veto
-        if (35.0 < mean_h < 95.0) and (mean_s > max(75.0, dyn["s_hi"])) and (mean_v > max(175.0, dyn["v_dark"])) and (mean_a < dyn["a_red"]):
+        if (35.0 < mean_h < 95.0) and (mean_s > max(75.0, dyn["s_hi"])) and (mean_v > max(175.0, dyn["v_dark"])) and (
+            mean_a < dyn["a_red"]
+        ):
             return 0.0
 
-        # ---------------- Stage 2: scoring ----------------
         hsv_score = 0.0
-
         is_rust_hue = (mean_h < 55.0 or mean_h > 165.0)
         if is_rust_hue and mean_s > max(20.0, dyn["s_low"] * 0.7):
             hsv_score += 1.0
 
-        # Saturation: partial credit for browns
         if mean_s > dyn["s_hi"]:
             hsv_score += 1.0
         elif mean_s > dyn["s_mid"]:
@@ -598,17 +537,14 @@ class FastRustDetector:
         elif mean_s > dyn["s_low"]:
             hsv_score += 0.25
         else:
-            # extra small credit for very dark segments with low S (dark/brown rust)
             if dark_relax and mean_v < dyn["v_dark"]:
                 hsv_score += 0.15
 
-        # Value: darker tends to be rustier
         if mean_v < dyn["v_dark"]:
             hsv_score += 1.0
         elif mean_v < (dyn["v_dark"] + 50.0):
             hsv_score += 0.5
 
-        # Redness (Lab a*)
         if mean_a > dyn["a_red_hi"]:
             hsv_score += 2.2
         elif mean_a > dyn["a_red"]:
@@ -616,7 +552,6 @@ class FastRustDetector:
         elif mean_a > (dyn["a_red"] - (12.0 if dark_relax else 7.0)):
             hsv_score += 1.0
 
-        # Warmth (Lab b*) — a bit more weight (helps brown/black rust)
         if mean_b > dyn["b_orange_hi"]:
             hsv_score += 0.8
         elif mean_b > dyn["b_orange"]:
@@ -626,7 +561,6 @@ class FastRustDetector:
 
         hsv_norm = min(1.0, hsv_score / 4.0)
 
-        # Texture
         tex_rough = min(1.0, mean_rough / max(26.0, dyn["rough_hi"] * 2.0))
         tex_ent = min(1.0, mean_ent / max(16.0, dyn["ent_hi"] * 1.8))
         tex = (tex_rough + tex_ent) / 2.0
@@ -635,11 +569,9 @@ class FastRustDetector:
 
         rust_score = 0.80 * hsv_norm + 0.20 * tex
 
-        # Brown-rust allowance: low S but dark + warm-ish
         if (mean_s < dyn["s_mid"]) and (mean_v < dyn["v_dark"]) and (mean_b > (dyn["b_warm"] - 4.0)):
             rust_score = max(rust_score, 0.74 if dark_relax else 0.70)
 
-        # Very dark boost
         if mean_v < (very_dark_gate + 15.0) and (textured_enough or mean_b > dyn["b_warm"]):
             rust_score = max(rust_score, 0.78)
 
@@ -827,10 +759,9 @@ class FastRustDetector:
             dynamic_gates=res["dynamic_gates"],
         )
 
-    # ---- Visualization ----
+    # ---- Visualization (ONLY 2 PANELS) ----
     @staticmethod
     def _tight_bbox_from_mask(mask_u8: np.ndarray, pad: int = 2) -> Tuple[int, int, int, int]:
-        """Return tight bbox (x1,y1,x2,y2) inside mask image coordinates."""
         ys, xs = np.where(mask_u8 > 0)
         if len(xs) == 0 or len(ys) == 0:
             h, w = mask_u8.shape[:2]
@@ -845,75 +776,46 @@ class FastRustDetector:
         return x1, y1, x2, y2
 
     def visualize_detection(self, results: Dict, save_path: str | None = None) -> plt.Figure:
+        """
+        Shows ONLY:
+          1) Metal Input (tight crop, non-metal -> white)
+          2) Final Detection Result (Rust=Red) on full original
+        """
         crop = results["crop"]
-        segments = results["segments"]
         full_mask = results["full_mask"]
         original = results["original"]
         rust_percentage = results["rust_percentage"]
         metal_mask = results.get("metal_mask", np.ones(crop.shape[:2], dtype=np.uint8)).astype(np.uint8)
-        score_map = results.get("score_map", np.zeros(crop.shape[:2], dtype=np.float32))
         thr = float(results.get("threshold_used", self.rust_threshold_fallback))
 
-        # ---- Tight crop to metal bbox for subplots 1-5 (no black background) ----
+        # ---- Tight crop for Metal Input ----
         x1, y1, x2, y2 = self._tight_bbox_from_mask(metal_mask, pad=2)
         crop_t = crop[y1:y2, x1:x2]
         mask_t = metal_mask[y1:y2, x1:x2]
-        seg_t = segments[y1:y2, x1:x2]
-        score_t = score_map[y1:y2, x1:x2]
 
-        # 1) Metal Input: set non-metal pixels to white (NO black)
         metal_input = crop_t.copy()
-        metal_input[mask_t == 0] = 255
+        metal_input[mask_t == 0] = 255  # outside metal -> white
 
-        # 2) SLIC boundaries drawn on the same "white background" metal input
-        vis_segments = mark_boundaries(cv2.cvtColor(metal_input, cv2.COLOR_BGR2RGB), seg_t)
-
-        # 3) LAB a* (show only metal; outside metal -> neutral 128)
-        lab_crop = cv2.cvtColor(crop_t, cv2.COLOR_BGR2Lab)
-        lab_a = lab_crop[:, :, 1].copy()
-        lab_a[mask_t == 0] = 128
-
-        # 5) Rust-score heatmap inside metal (outside -> 0)
-        score_vis = cv2.normalize(score_t, None, 0, 1, cv2.NORM_MINMAX)
-        score_vis_rgb = plt.cm.inferno(score_vis)[:, :, :3]
-        score_vis_rgb[mask_t == 0] = 1.0  # white outside metal
-
-        # 6) Final result stays on full original (as before)
+        # ---- Final overlay on full original ----
         vis_final = original.copy()
         vis_final[full_mask == 1] = [0, 0, 255]  # red in BGR
         vis_final = cv2.addWeighted(original, 0.6, vis_final, 0.4, 0)
 
-        fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+        # ---- 2-panel figure ----
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
         fig.suptitle(
             f"Fast Rust Detection [PER-SEGMENT] | Segments: {self.n_segments}\n"
             f"Coverage (Metal): {rust_percentage:.1f}% | Threshold used: {thr:.2f}",
             fontsize=12,
         )
 
-        axes[0, 0].imshow(cv2.cvtColor(metal_input, cv2.COLOR_BGR2RGB))
-        axes[0, 0].set_title("1. Metal Input (Tight Crop, No Black BG)")
-        axes[0, 0].axis("off")
+        axes[0].imshow(cv2.cvtColor(metal_input, cv2.COLOR_BGR2RGB))
+        axes[0].set_title("1. Metal Input (Tight Crop)")
+        axes[0].axis("off")
 
-        axes[0, 1].imshow(vis_segments)
-        axes[0, 1].set_title(f"2. SLIC (tight) ({len(np.unique(seg_t))} segments)")
-        axes[0, 1].axis("off")
-
-        im_a = axes[0, 2].imshow(lab_a, cmap="RdYlGn_r", vmin=0, vmax=255)
-        axes[0, 2].set_title("3. LAB a* (Green↔Red) [tight]")
-        axes[0, 2].axis("off")
-        plt.colorbar(im_a, ax=axes[0, 2], fraction=0.046)
-
-        axes[1, 0].imshow(mask_t, cmap="gray")
-        axes[1, 0].set_title("4. Metal Mask (tight)")
-        axes[1, 0].axis("off")
-
-        axes[1, 1].imshow(score_vis_rgb)
-        axes[1, 1].set_title("5. Per-Segment Rust Score (Heatmap) [tight]")
-        axes[1, 1].axis("off")
-
-        axes[1, 2].imshow(cv2.cvtColor(vis_final, cv2.COLOR_BGR2RGB))
-        axes[1, 2].set_title("6. Final Detection Result (Rust=Red)")
-        axes[1, 2].axis("off")
+        axes[1].imshow(cv2.cvtColor(vis_final, cv2.COLOR_BGR2RGB))
+        axes[1].set_title("2. Final Detection Result (Rust=Red)")
+        axes[1].axis("off")
 
         plt.tight_layout()
         plt.show()
@@ -969,7 +871,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--otsu_bias",
         type=float,
-        default=-0.05,
+        default=-0.02,
         help="Bias applied to Otsu-derived threshold (negative => more inclusive).",
     )
     return p
@@ -999,7 +901,7 @@ def main():
     )
 
     results = detector.analyze(image_path, interactive=bool(args.interactive))
-    out = f"results/{os.path.splitext(os.path.basename(image_path))[0]}_result.png"
+    out = f"results/New/{os.path.splitext(os.path.basename(image_path))[0]}_result.png"
     detector.visualize_detection(results, save_path=out)
 
 

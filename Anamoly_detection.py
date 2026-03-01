@@ -20,6 +20,13 @@ try:
 except Exception:
     LBP_AVAILABLE = False
 
+# Optional (better covariance shrinkage for anomaly model)
+try:
+    from sklearn.covariance import LedoitWolf  # type: ignore
+    SKLEARN_COV_AVAILABLE = True
+except Exception:
+    SKLEARN_COV_AVAILABLE = False
+
 
 # ----------------------------- File Picker -----------------------------
 def _get_tk_root():
@@ -54,23 +61,123 @@ def pick_image_file(
     return path
 
 
+# ----------------------------- Anomaly Model -----------------------------
+class RustAnomalyModel:
+    """
+    Lightweight anomaly model over per-segment feature vectors.
+
+    - Fit a Gaussian model (mean + covariance) on "clean metal" feature vectors.
+    - Inference: Mahalanobis distance -> anomaly score in [0,1].
+
+    You can fit:
+      A) per-image (no dataset): robustly choose "likely clean" segments, fit on them
+      B) dataset: pass a directory of clean images to build a global model (recommended)
+
+    Saved model is a .npz with 'mean' and 'icov'.
+    """
+
+    def __init__(self, eps: float = 1e-5):
+        self.eps = float(eps)
+        self.mean: Optional[np.ndarray] = None
+        self.icov: Optional[np.ndarray] = None
+
+    def is_ready(self) -> bool:
+        return self.mean is not None and self.icov is not None
+
+    def save(self, path: str):
+        if not self.is_ready():
+            raise RuntimeError("Model not fitted.")
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        np.savez_compressed(path, mean=self.mean, icov=self.icov)
+
+    def load(self, path: str):
+        d = np.load(path)
+        self.mean = d["mean"].astype(np.float32)
+        self.icov = d["icov"].astype(np.float32)
+
+    @staticmethod
+    def _nan_to_num(X: np.ndarray) -> np.ndarray:
+        X = X.astype(np.float32, copy=False)
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        return X
+
+    def fit(self, X: np.ndarray):
+        """
+        Fit mean + inverse covariance using shrinkage if available.
+        X: (N, D)
+        """
+        X = self._nan_to_num(X)
+        if X.ndim != 2 or X.shape[0] < max(10, X.shape[1] + 2):
+            raise ValueError(f"Not enough samples to fit anomaly model. Got X={X.shape}")
+
+        if SKLEARN_COV_AVAILABLE:
+            lw = LedoitWolf().fit(X)
+            cov = lw.covariance_.astype(np.float32)
+            mean = lw.location_.astype(np.float32)
+        else:
+            # Simple shrinkage covariance
+            mean = X.mean(axis=0).astype(np.float32)
+            Xc = X - mean
+            cov = np.cov(Xc, rowvar=False).astype(np.float32)
+
+            # Shrinkage towards diagonal for stability
+            diag = np.diag(np.diag(cov))
+            alpha = 0.10
+            cov = (1 - alpha) * cov + alpha * diag
+
+        # Regularize
+        cov = cov + np.eye(cov.shape[0], dtype=np.float32) * self.eps
+        icov = np.linalg.pinv(cov).astype(np.float32)
+
+        self.mean = mean
+        self.icov = icov
+
+    def score(self, X: np.ndarray) -> np.ndarray:
+        """
+        Mahalanobis distance -> mapped to [0,1] with a robust logistic mapping.
+        """
+        if not self.is_ready():
+            raise RuntimeError("Model not fitted/loaded.")
+        X = self._nan_to_num(X)
+
+        mu = self.mean.reshape(1, -1)
+        ic = self.icov
+
+        Xc = X - mu
+        # d^2 = x^T icov x
+        d2 = np.einsum("bi,ij,bj->b", Xc, ic, Xc).astype(np.float32)
+        d2 = np.maximum(d2, 0.0)
+
+        # Robust scaling to [0,1] using percentiles
+        p50 = float(np.percentile(d2, 50))
+        p95 = float(np.percentile(d2, 95))
+        scale = max(p95 - p50, 1e-6)
+        z = (d2 - p50) / scale  # roughly: 0 around median, ~1 around 95th
+
+        # Logistic mapping
+        scores = 1.0 / (1.0 + np.exp(-2.0 * (z - 0.5)))
+        return scores.astype(np.float32)
+
+
 # ----------------------------- Core Detector -----------------------------
 class FastRustDetector:
     """
-    Per-segment feature vectors:
-      - Each SLIC segment == one feature vector (your "one cluster -> one vector").
-      - Each feature vector is classified rust/no-rust.
+    Rust detection on metal parts.
 
-    Dynamic thresholds:
-      - Dynamic feature gates (Option A): derive feature cutoffs from percentiles of METAL segments in the image.
-      - Dynamic score threshold (Option B): derive final score cutoff from Otsu over rust_scores (metal segments).
+    Two modes:
+      1) mode="heuristic" : your existing per-segment rust score (color+texture)
+      2) mode="anomaly"   : anomaly detection over per-segment feature vectors
+                            (Mahalanobis distance) + rust color prior
 
-    Updates in this version:
-      1) "Metal Input" visualization is tightly cropped to the metal mask bbox, with NO black background.
-      2) Dark brown / near-black rust is more likely to classify as rust:
-         - relaxed warm-veto for very dark segments
-         - stronger "dark rust" allowance
-         - slightly more permissive Otsu threshold (biased lower + wider clamp)
+    Key idea for anomaly mode:
+      - If you provide a directory of CLEAN metal images, it will build a global anomaly model
+        and then score anomalies on the target image.
+      - If you do NOT provide a clean directory/model, it will fit a *per-image* anomaly model
+        using segments that look "likely clean" (robust subset selection).
+
+    Notes:
+      - "Anatoly detection" is typically meant as "Anomaly detection".
+      - This code keeps your SAM-based interactive metal selection.
     """
 
     def __init__(
@@ -79,16 +186,22 @@ class FastRustDetector:
         fast_mode: bool = False,
         verbose: bool = True,
         sam_checkpoint: str = "sam2.1_b.pt",
-        # Fallback / default behavior:
+        # Scoring threshold behavior:
         rust_threshold_fallback: float = 0.60,
         ensure_one_positive: bool = True,
-        # Dynamic behavior toggles:
         dynamic_feature_gates: bool = True,
         dynamic_score_threshold: bool = True,
-        # Safety knobs:
         min_valid_segments_for_dynamic: int = 20,
-        # Otsu bias (negative makes it more inclusive):
         otsu_bias: float = -0.05,
+        # Mode control
+        mode: str = "anomaly",  # "anomaly" or "heuristic"
+        # Anomaly config
+        anomaly_weight: float = 0.70,  # how much anomaly influences final score (rest is rust prior)
+        rust_prior_weight: float = 0.30,
+        anomaly_threshold_mode: str = "otsu",  # "otsu" or "percentile"
+        anomaly_percentile: float = 92.0,  # used if anomaly_threshold_mode="percentile"
+        anomaly_model_path: str = "",  # load/save anomaly model
+        clean_dir: str = "",  # directory of CLEAN images to fit anomaly model
     ):
         self.n_segments = int(n_segments)
         self.fast_mode = bool(fast_mode)
@@ -102,6 +215,27 @@ class FastRustDetector:
         self.min_valid_segments_for_dynamic = int(min_valid_segments_for_dynamic)
         self.otsu_bias = float(otsu_bias)
 
+        self.mode = str(mode).strip().lower()
+        if self.mode not in ("heuristic", "anomaly"):
+            raise ValueError("mode must be 'heuristic' or 'anomaly'.")
+
+        self.anomaly_weight = float(anomaly_weight)
+        self.rust_prior_weight = float(rust_prior_weight)
+        s = self.anomaly_weight + self.rust_prior_weight
+        if s <= 0:
+            self.anomaly_weight, self.rust_prior_weight = 0.7, 0.3
+        else:
+            self.anomaly_weight /= s
+            self.rust_prior_weight /= s
+
+        self.anomaly_threshold_mode = str(anomaly_threshold_mode).strip().lower()
+        if self.anomaly_threshold_mode not in ("otsu", "percentile"):
+            raise ValueError("anomaly_threshold_mode must be 'otsu' or 'percentile'.")
+        self.anomaly_percentile = float(anomaly_percentile)
+
+        self.anomaly_model_path = str(anomaly_model_path)
+        self.clean_dir = str(clean_dir)
+
         # SAM
         self.sam_checkpoint = sam_checkpoint
         self.sam_model = None
@@ -114,10 +248,14 @@ class FastRustDetector:
         self.erosion_iterations = 2
         self.dilation_iterations = 2
 
+        # Anomaly model
+        self.anom_model = RustAnomalyModel(eps=1e-4)
+
         if self.verbose:
             self._print_backend_info()
 
         self.load_sam2_model()
+        self._maybe_prepare_anomaly_model()
 
     # ---- logging ----
     def _log(self, msg: str):
@@ -126,15 +264,26 @@ class FastRustDetector:
 
     def _print_backend_info(self):
         print("FastRustDetector initialized:")
-        print("  Mode: PER-SEGMENT feature vectors (no clustering)")
+        print("  Per-segment feature vectors (SLIC segments)")
         print(f"  Target segments: {self.n_segments}")
         print(f"  Fast mode: {self.fast_mode}")
-        print(f"  Dynamic feature gates: {self.dynamic_feature_gates}")
-        print(f"  Dynamic score threshold (Otsu): {self.dynamic_score_threshold}")
-        print(f"  Fallback rust threshold: {self.rust_threshold_fallback:.2f}")
+        print(f"  Mode: {self.mode}")
+        print(f"  Dynamic feature gates (heuristic): {self.dynamic_feature_gates}")
+        print(f"  Dynamic score threshold (heuristic Otsu): {self.dynamic_score_threshold}")
+        print(f"  Fallback rust threshold (heuristic): {self.rust_threshold_fallback:.2f}")
         print(f"  Ensure one positive: {self.ensure_one_positive}")
         print(f"  Min valid segments for dynamic: {self.min_valid_segments_for_dynamic}")
-        print(f"  Otsu bias: {self.otsu_bias:+.2f}")
+        print(f"  Heuristic Otsu bias: {self.otsu_bias:+.2f}")
+        if self.mode == "anomaly":
+            print(f"  Anomaly weights: anomaly={self.anomaly_weight:.2f}, rust_prior={self.rust_prior_weight:.2f}")
+            print(f"  Anomaly threshold mode: {self.anomaly_threshold_mode}")
+            if self.anomaly_threshold_mode == "percentile":
+                print(f"  Anomaly percentile: {self.anomaly_percentile:.1f}")
+            if self.anomaly_model_path:
+                print(f"  Anomaly model path: {self.anomaly_model_path}")
+            if self.clean_dir:
+                print(f"  Clean directory: {self.clean_dir}")
+            print(f"  sklearn LedoitWolf available: {SKLEARN_COV_AVAILABLE}")
 
     # ---- SAM ----
     def load_sam2_model(self):
@@ -445,7 +594,7 @@ class FastRustDetector:
 
         return features, unique_segments, metal_scores
 
-    # --------------------- Dynamic thresholds helpers ---------------------
+    # --------------------- Dynamic thresholds helpers (heuristic) ---------------------
     @staticmethod
     def _robust_percentile(vals: np.ndarray, q: float, default: float, min_n: int = 10) -> float:
         vals = vals[np.isfinite(vals)]
@@ -454,10 +603,6 @@ class FastRustDetector:
         return float(np.percentile(vals, q))
 
     def _compute_dynamic_gates(self, features_valid: np.ndarray) -> Dict[str, float]:
-        """
-        Derive dynamic gates from the image itself (metal-only segments).
-        Uses percentiles; falls back to the classic constants if data is scarce.
-        """
         a_vals = features_valid[:, 1] if features_valid.size else np.array([])
         b_vals = features_valid[:, 2] if features_valid.size else np.array([])
         s_vals = features_valid[:, 13] if features_valid.size else np.array([])
@@ -482,7 +627,6 @@ class FastRustDetector:
             "ent_hi": self._robust_percentile(ent_vals, 75, 10.0),
         }
 
-        # clamp to sane ranges
         dyn["a_warm"] = float(np.clip(dyn["a_warm"], 110.0, 155.0))
         dyn["b_warm"] = float(np.clip(dyn["b_warm"], 110.0, 155.0))
         dyn["a_red"] = float(np.clip(dyn["a_red"], dyn["a_warm"], 175.0))
@@ -504,28 +648,21 @@ class FastRustDetector:
         return dyn
 
     def _compute_dynamic_score_threshold_otsu(self, rust_scores_valid: np.ndarray) -> float:
-        """
-        Otsu threshold on rust_scores (0..1) for metal segments.
-        Slightly biased lower to include darker/brown rust.
-        """
         scores = rust_scores_valid[np.isfinite(rust_scores_valid)]
         if scores.size < self.min_valid_segments_for_dynamic:
             return float(self.rust_threshold_fallback)
 
         s255 = np.clip(scores * 255.0, 0, 255).astype(np.uint8)
-
         if int(s255.max()) - int(s255.min()) < 5:
             return float(self.rust_threshold_fallback)
 
         t, _ = cv2.threshold(s255, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         thr = float(t) / 255.0
-
-        # Bias + clamp (more permissive than before)
         thr = float(thr + self.otsu_bias)
         thr = float(np.clip(thr, 0.25, 0.75))
         return thr
 
-    # --------------------- Per-vector classifier ---------------------
+    # --------------------- Heuristic per-vector classifier ---------------------
     def _rust_score_for_feature(self, fv: np.ndarray, dyn: Optional[Dict[str, float]] = None) -> float:
         mean_a = float(fv[1])
         mean_b = float(fv[2])
@@ -553,44 +690,39 @@ class FastRustDetector:
                 "ent_hi": 10.0,
             }
 
-        # ---------------- Stage 0: stronger dark-rust allowance ----------------
-        # If very dark, allow rust with texture OR just "not-cold" b* (brownish) even if a* is low.
-        very_dark_gate = max(dyn["v_very_dark"], 70.0)  # helps for your dark brown/black
+        very_dark_gate = max(dyn["v_very_dark"], 70.0)
         is_very_dark = (mean_v < very_dark_gate)
 
         textured_enough = (mean_rough > dyn["rough_hi"] * 0.75) or (mean_ent > dyn["ent_hi"] * 0.75)
-        brownish_enough = (mean_b > (dyn["b_warm"] - 6.0))  # allow darker browns
+        brownish_enough = (mean_b > (dyn["b_warm"] - 6.0))
 
         if is_very_dark and (textured_enough or brownish_enough):
             return 0.82
 
-        # ---------------- Stage 1: vetoes (relaxed for dark segments) ----------------
         if mean_v > dyn["v_hi"]:
             return 0.0
 
-        # Warm gate: for dark segments, relax the warm requirement (black/brown rust can have lower a*)
         dark_relax = mean_v < (dyn["v_dark"] * 0.65)
         a_min = dyn["a_warm"] - (14.0 if dark_relax else 0.0)
         b_min = dyn["b_warm"] - (14.0 if dark_relax else 0.0)
         if mean_a < a_min or mean_b < b_min:
             return 0.0
 
-        # Brown rust can be low S; only veto very low S if not red enough and not dark.
-        if (mean_s < dyn["s_low"]) and (mean_a < (dyn["a_red"] - (10.0 if dark_relax else 0.0))) and (mean_v > (dyn["v_dark"] * 0.55)):
+        if (mean_s < dyn["s_low"]) and (mean_a < (dyn["a_red"] - (10.0 if dark_relax else 0.0))) and (
+            mean_v > (dyn["v_dark"] * 0.55)
+        ):
             return 0.0
 
-        # Yellow/brass veto
-        if (35.0 < mean_h < 95.0) and (mean_s > max(75.0, dyn["s_hi"])) and (mean_v > max(175.0, dyn["v_dark"])) and (mean_a < dyn["a_red"]):
+        if (35.0 < mean_h < 95.0) and (mean_s > max(75.0, dyn["s_hi"])) and (mean_v > max(175.0, dyn["v_dark"])) and (
+            mean_a < dyn["a_red"]
+        ):
             return 0.0
 
-        # ---------------- Stage 2: scoring ----------------
         hsv_score = 0.0
-
         is_rust_hue = (mean_h < 55.0 or mean_h > 165.0)
         if is_rust_hue and mean_s > max(20.0, dyn["s_low"] * 0.7):
             hsv_score += 1.0
 
-        # Saturation: partial credit for browns
         if mean_s > dyn["s_hi"]:
             hsv_score += 1.0
         elif mean_s > dyn["s_mid"]:
@@ -598,17 +730,14 @@ class FastRustDetector:
         elif mean_s > dyn["s_low"]:
             hsv_score += 0.25
         else:
-            # extra small credit for very dark segments with low S (dark/brown rust)
             if dark_relax and mean_v < dyn["v_dark"]:
                 hsv_score += 0.15
 
-        # Value: darker tends to be rustier
         if mean_v < dyn["v_dark"]:
             hsv_score += 1.0
         elif mean_v < (dyn["v_dark"] + 50.0):
             hsv_score += 0.5
 
-        # Redness (Lab a*)
         if mean_a > dyn["a_red_hi"]:
             hsv_score += 2.2
         elif mean_a > dyn["a_red"]:
@@ -616,7 +745,6 @@ class FastRustDetector:
         elif mean_a > (dyn["a_red"] - (12.0 if dark_relax else 7.0)):
             hsv_score += 1.0
 
-        # Warmth (Lab b*) — a bit more weight (helps brown/black rust)
         if mean_b > dyn["b_orange_hi"]:
             hsv_score += 0.8
         elif mean_b > dyn["b_orange"]:
@@ -626,7 +754,6 @@ class FastRustDetector:
 
         hsv_norm = min(1.0, hsv_score / 4.0)
 
-        # Texture
         tex_rough = min(1.0, mean_rough / max(26.0, dyn["rough_hi"] * 2.0))
         tex_ent = min(1.0, mean_ent / max(16.0, dyn["ent_hi"] * 1.8))
         tex = (tex_rough + tex_ent) / 2.0
@@ -635,19 +762,176 @@ class FastRustDetector:
 
         rust_score = 0.80 * hsv_norm + 0.20 * tex
 
-        # Brown-rust allowance: low S but dark + warm-ish
         if (mean_s < dyn["s_mid"]) and (mean_v < dyn["v_dark"]) and (mean_b > (dyn["b_warm"] - 4.0)):
             rust_score = max(rust_score, 0.74 if dark_relax else 0.70)
 
-        # Very dark boost
         if mean_v < (very_dark_gate + 15.0) and (textured_enough or mean_b > dyn["b_warm"]):
             rust_score = max(rust_score, 0.78)
 
         return float(np.clip(rust_score, 0.0, 1.0))
 
-    # ---- Segmentation analysis ----
-    def _perform_segmentation_analysis(self, crop: np.ndarray, metal_mask_crop: np.ndarray) -> Dict:
-        segments = slic(
+    # --------------------- Rust prior for anomaly mode ---------------------
+    def _rust_prior_for_feature(self, fv: np.ndarray) -> float:
+        """
+        A mild, lighting-tolerant rust prior from the feature vector.
+        Higher when warm/brown/red and not super bright.
+        """
+        mean_a = float(fv[1])
+        mean_b = float(fv[2])
+        mean_h = float(fv[12])
+        mean_s = float(fv[13])
+        mean_v = float(fv[14])
+        rough = float(fv[6])
+        ent = float(fv[7])
+
+        # Hue: rust-ish (wrap-around reds)
+        hue_rust = 1.0 if (mean_h < 55.0 or mean_h > 165.0) else 0.0
+
+        # Warmth and redness (Lab)
+        warm = np.clip((mean_b - 118.0) / 35.0, 0.0, 1.0)
+        red = np.clip((mean_a - 130.0) / 35.0, 0.0, 1.0)
+
+        # Dark/brown rust can be low S; so just mild saturation use
+        sat = np.clip((mean_s - 15.0) / 80.0, 0.0, 1.0)
+
+        # Prefer not-too-bright (but allow dark rust)
+        val = 1.0 - np.clip((mean_v - 110.0) / 160.0, 0.0, 1.0)
+
+        # Texture (helps distinguish stains vs flat paint)
+        tex = np.clip((rough / 25.0 + ent / 14.0) * 0.5, 0.0, 1.0)
+
+        prior = 0.30 * hue_rust + 0.25 * warm + 0.25 * red + 0.10 * sat + 0.10 * val
+        prior = max(prior, 0.55 * tex)  # if texture is strong, allow prior to rise
+        return float(np.clip(prior, 0.0, 1.0))
+
+    # --------------------- Anomaly threshold helper ---------------------
+    def _threshold_scores(self, scores_valid: np.ndarray, fallback: float) -> float:
+        scores = scores_valid[np.isfinite(scores_valid)]
+        if scores.size < self.min_valid_segments_for_dynamic:
+            return float(fallback)
+
+        if self.anomaly_threshold_mode == "percentile":
+            thr = float(np.percentile(scores, self.anomaly_percentile))
+            return float(np.clip(thr, 0.25, 0.90))
+
+        # Otsu on 0..1
+        s255 = np.clip(scores * 255.0, 0, 255).astype(np.uint8)
+        if int(s255.max()) - int(s255.min()) < 5:
+            return float(fallback)
+        t, _ = cv2.threshold(s255, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        thr = float(t) / 255.0
+        # make it a bit more inclusive for anomalies
+        thr = float(np.clip(thr - 0.03, 0.20, 0.85))
+        return thr
+
+    # --------------------- Anomaly model preparation ---------------------
+    @staticmethod
+    def _iter_images_in_dir(folder: str) -> List[str]:
+        exts = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+        out = []
+        for root, _, files in os.walk(folder):
+            for f in files:
+                if f.lower().endswith(exts):
+                    out.append(os.path.join(root, f))
+        return sorted(out)
+
+    def _maybe_prepare_anomaly_model(self):
+        """
+        If mode=anomaly:
+          - load model from anomaly_model_path if it exists
+          - else if clean_dir is provided, fit model from clean images and save if anomaly_model_path given
+        """
+        if self.mode != "anomaly":
+            return
+
+        if self.anomaly_model_path and os.path.exists(self.anomaly_model_path):
+            try:
+                self.anom_model.load(self.anomaly_model_path)
+                self._log(f"Loaded anomaly model: {self.anomaly_model_path}")
+                return
+            except Exception as e:
+                self._log(f"Failed to load anomaly model ({self.anomaly_model_path}): {e}")
+
+        if self.clean_dir and os.path.isdir(self.clean_dir):
+            self._log(f"Fitting anomaly model from clean_dir: {self.clean_dir}")
+            feats_all = []
+            img_paths = self._iter_images_in_dir(self.clean_dir)
+            if len(img_paths) == 0:
+                self._log("No images found in clean_dir. Will fall back to per-image fit.")
+                return
+
+            # Fit on full image (metal mask assumed entire image unless you want SAM here too)
+            for p in img_paths:
+                img = cv2.imread(p)
+                if img is None:
+                    continue
+                # Use full image as "metal" for model training; you can replace with your own metal mask logic.
+                crop = img
+                metal_mask = np.ones(crop.shape[:2], dtype=np.uint8)
+                seg = slic(
+                    img_as_float(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)),
+                    n_segments=max(2000, self.n_segments // 4),
+                    compactness=20,
+                    sigma=1,
+                    start_label=0,
+                    channel_axis=2,
+                )
+                fmap = self._compute_feature_maps(crop)
+                fmap["metal_mask"] = metal_mask
+                features, _, metal_scores = self._extract_features_vectorized(fmap, seg)
+                valid = metal_scores > 0.5
+                if np.any(valid):
+                    feats_all.append(features[valid])
+
+            if len(feats_all) == 0:
+                self._log("No valid features extracted from clean_dir. Will fall back to per-image fit.")
+                return
+
+            X = np.concatenate(feats_all, axis=0)
+            try:
+                self.anom_model.fit(X)
+                self._log(f"Anomaly model fitted on {X.shape[0]} segments (D={X.shape[1]}).")
+                if self.anomaly_model_path:
+                    self.anom_model.save(self.anomaly_model_path)
+                    self._log(f"Saved anomaly model to: {self.anomaly_model_path}")
+            except Exception as e:
+                self._log(f"Failed to fit anomaly model from clean_dir: {e}")
+
+        else:
+            if self.clean_dir:
+                self._log(f"clean_dir not found/invalid: {self.clean_dir} (will use per-image fit)")
+
+    # --------------------- Per-image anomaly fit (no dataset) ---------------------
+    def _fit_anomaly_model_per_image(self, features_valid: np.ndarray) -> bool:
+        """
+        Robustly select likely-clean subset then fit.
+        Strategy:
+          - compute rust prior; take lowest ~70% prior (least rust-looking)
+          - fit model
+        """
+        if features_valid.shape[0] < max(self.min_valid_segments_for_dynamic, 25):
+            return False
+
+        priors = np.array([self._rust_prior_for_feature(fv) for fv in features_valid], dtype=np.float32)
+        cutoff = float(np.percentile(priors, 70.0))
+        clean_idx = np.where(priors <= cutoff)[0]
+        if clean_idx.size < max(20, features_valid.shape[1] + 2):
+            # fallback: take lowest 80%
+            cutoff = float(np.percentile(priors, 80.0))
+            clean_idx = np.where(priors <= cutoff)[0]
+
+        if clean_idx.size < max(20, features_valid.shape[1] + 2):
+            return False
+
+        try:
+            self.anom_model.fit(features_valid[clean_idx])
+            return True
+        except Exception:
+            return False
+
+    # --------------------- Segmentation analysis (shared) ---------------------
+    def _perform_segmentation(self, crop: np.ndarray) -> np.ndarray:
+        return slic(
             img_as_float(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)),
             n_segments=self.n_segments,
             compactness=20,
@@ -656,52 +940,157 @@ class FastRustDetector:
             channel_axis=2,
         )
 
+    def _perform_analysis(self, crop: np.ndarray, metal_mask_crop: np.ndarray) -> Dict:
+        segments = self._perform_segmentation(crop)
+
         fmap = self._compute_feature_maps(crop)
         fmap["metal_mask"] = metal_mask_crop
 
         features, segment_ids, metal_scores = self._extract_features_vectorized(fmap, segments)
-
         valid = metal_scores > 0.5
         valid_indices = np.where(valid)[0]
         n_valid = int(len(valid_indices))
 
-        dyn_gates: Optional[Dict[str, float]] = None
-        if self.dynamic_feature_gates and n_valid >= self.min_valid_segments_for_dynamic:
-            dyn_gates = self._compute_dynamic_gates(features[valid_indices])
-
-        rust_scores = np.zeros(len(features), dtype=np.float32)
-        if n_valid > 0:
-            for i in valid_indices:
-                rust_scores[i] = self._rust_score_for_feature(features[i], dyn=dyn_gates)
-
-        if self.dynamic_score_threshold and n_valid >= self.min_valid_segments_for_dynamic:
-            thr = self._compute_dynamic_score_threshold_otsu(rust_scores[valid_indices])
-        else:
-            thr = float(self.rust_threshold_fallback)
-
-        rust_pred = np.zeros(len(features), dtype=np.uint8)
-        if n_valid > 0:
-            rust_pred[valid_indices] = (rust_scores[valid_indices] >= thr).astype(np.uint8)
-
-            if self.ensure_one_positive and int(np.sum(rust_pred[valid_indices])) == 0:
-                best_i = valid_indices[int(np.argmax(rust_scores[valid_indices]))]
-                rust_pred[best_i] = 1
+        # Maps
+        score_map = np.zeros(crop.shape[:2], dtype=np.float32)
+        pred_map = np.zeros(crop.shape[:2], dtype=np.uint8)
+        final_mask = np.zeros(crop.shape[:2], dtype=np.uint8)
 
         seg_areas = np.bincount(segments.ravel())
         rust_pixels = 0
         metal_pixels = 0
 
-        final_mask = np.zeros(crop.shape[:2], dtype=np.uint8)
-        score_map = np.zeros(crop.shape[:2], dtype=np.float32)
-        pred_map = np.zeros(crop.shape[:2], dtype=np.uint8)
+        # ----------------- MODE: HEURISTIC -----------------
+        if self.mode == "heuristic":
+            dyn_gates: Optional[Dict[str, float]] = None
+            if self.dynamic_feature_gates and n_valid >= self.min_valid_segments_for_dynamic:
+                dyn_gates = self._compute_dynamic_gates(features[valid_indices])
 
-        for idx in valid_indices:
+            rust_scores = np.zeros(len(features), dtype=np.float32)
+            if n_valid > 0:
+                for i in valid_indices:
+                    rust_scores[i] = self._rust_score_for_feature(features[i], dyn=dyn_gates)
+
+            if self.dynamic_score_threshold and n_valid >= self.min_valid_segments_for_dynamic:
+                thr = self._compute_dynamic_score_threshold_otsu(rust_scores[valid_indices])
+            else:
+                thr = float(self.rust_threshold_fallback)
+
+            rust_pred = np.zeros(len(features), dtype=np.uint8)
+            if n_valid > 0:
+                rust_pred[valid_indices] = (rust_scores[valid_indices] >= thr).astype(np.uint8)
+                if self.ensure_one_positive and int(np.sum(rust_pred[valid_indices])) == 0:
+                    best_i = valid_indices[int(np.argmax(rust_scores[valid_indices]))]
+                    rust_pred[best_i] = 1
+
+            for idx in valid_indices:
+                sid = int(segment_ids[idx])
+                area = int(seg_areas[sid]) if sid < len(seg_areas) else 0
+                metal_pixels += area
+                m = (segments == sid)
+
+                score_map[m] = float(rust_scores[idx])
+                pred_map[m] = int(rust_pred[idx])
+
+                if rust_pred[idx] == 1:
+                    rust_pixels += area
+                    final_mask[m] = 1
+
+            # clean-up
+            kernel = np.ones((3, 3), np.uint8)
+            final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_OPEN, kernel)
+            final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, kernel)
+            final_mask = final_mask * metal_mask_crop
+
+            pct = (rust_pixels / metal_pixels) if metal_pixels > 0 else 0.0
+
+            if self.verbose:
+                self._log(f"[heuristic] Valid metal segments: {n_valid}")
+                self._log(f"[heuristic] Threshold used: {thr:.3f}")
+
+            return {
+                "mode": "heuristic",
+                "segments": segments,
+                "features": features,
+                "segment_ids": segment_ids,
+                "metal_scores": metal_scores,
+                "valid_mask": valid,
+                "rust_scores": rust_scores,
+                "final_scores": rust_scores,
+                "rust_pred": rust_pred,
+                "score_map": score_map,
+                "pred_map": pred_map,
+                "crop_mask": final_mask,
+                "rust_percentage": pct,
+                "threshold_used": thr,
+                "dynamic_gates": dyn_gates,
+            }
+
+        # ----------------- MODE: ANOMALY -----------------
+        # 1) Get features for valid segments
+        if n_valid <= 0:
+            return {
+                "mode": "anomaly",
+                "segments": segments,
+                "features": features,
+                "segment_ids": segment_ids,
+                "metal_scores": metal_scores,
+                "valid_mask": valid,
+                "rust_scores": np.zeros(len(features), dtype=np.float32),
+                "final_scores": np.zeros(len(features), dtype=np.float32),
+                "rust_pred": np.zeros(len(features), dtype=np.uint8),
+                "score_map": score_map,
+                "pred_map": pred_map,
+                "crop_mask": final_mask,
+                "rust_percentage": 0.0,
+                "threshold_used": float(self.rust_threshold_fallback),
+                "dynamic_gates": None,
+                "anomaly_threshold": float(self.rust_threshold_fallback),
+            }
+
+        features_valid = features[valid_indices]
+
+        # 2) Ensure anomaly model is ready (global or per-image)
+        if not self.anom_model.is_ready():
+            ok = self._fit_anomaly_model_per_image(features_valid)
+            if self.verbose:
+                self._log(f"[anomaly] Per-image model fit: {'OK' if ok else 'FAILED'}")
+            if not ok:
+                # fallback: use heuristic if anomaly model cannot fit
+                self._log("[anomaly] Falling back to heuristic mode (insufficient segments for anomaly fit).")
+                prev_mode = self.mode
+                self.mode = "heuristic"
+                out = self._perform_analysis(crop, metal_mask_crop)
+                self.mode = prev_mode
+                return out
+
+        # 3) Anomaly score for valid segments
+        anom_scores_valid = self.anom_model.score(features_valid)  # 0..1
+        rust_priors_valid = np.array([self._rust_prior_for_feature(fv) for fv in features_valid], dtype=np.float32)
+
+        # 4) Combine: anomaly + rust prior
+        final_scores_valid = self.anomaly_weight * anom_scores_valid + self.rust_prior_weight * rust_priors_valid
+        final_scores = np.zeros(len(features), dtype=np.float32)
+        final_scores[valid_indices] = final_scores_valid
+
+        # 5) Threshold final score
+        thr = self._threshold_scores(final_scores_valid, fallback=self.rust_threshold_fallback)
+
+        rust_pred = np.zeros(len(features), dtype=np.uint8)
+        rust_pred[valid_indices] = (final_scores_valid >= thr).astype(np.uint8)
+
+        if self.ensure_one_positive and int(np.sum(rust_pred[valid_indices])) == 0:
+            best_i = valid_indices[int(np.argmax(final_scores_valid))]
+            rust_pred[best_i] = 1
+
+        # 6) Build maps and compute rust percentage
+        for j, idx in enumerate(valid_indices):
             sid = int(segment_ids[idx])
             area = int(seg_areas[sid]) if sid < len(seg_areas) else 0
             metal_pixels += area
-
             m = (segments == sid)
-            score_map[m] = float(rust_scores[idx])
+
+            score_map[m] = float(final_scores[idx])
             pred_map[m] = int(rust_pred[idx])
 
             if rust_pred[idx] == 1:
@@ -716,33 +1105,31 @@ class FastRustDetector:
         pct = (rust_pixels / metal_pixels) if metal_pixels > 0 else 0.0
 
         if self.verbose:
-            self._log(f"Valid metal segments: {n_valid}")
-            self._log(f"Final score threshold used: {thr:.3f} (dynamic={self.dynamic_score_threshold})")
-            if dyn_gates is not None:
-                gate_str = (
-                    f"a_warm={dyn_gates['a_warm']:.1f}, b_warm={dyn_gates['b_warm']:.1f}, "
-                    f"a_red={dyn_gates['a_red']:.1f}, b_orange={dyn_gates['b_orange']:.1f}, "
-                    f"v_dark={dyn_gates['v_dark']:.1f}, v_very_dark={dyn_gates['v_very_dark']:.1f}, "
-                    f"s_low={dyn_gates['s_low']:.1f}, s_mid={dyn_gates['s_mid']:.1f}, s_hi={dyn_gates['s_hi']:.1f}"
-                )
-                self._log(f"Dynamic gates: {gate_str}")
-            else:
-                self._log("Dynamic gates: OFF / insufficient segments (using defaults)")
+            self._log(f"[anomaly] Valid metal segments: {n_valid}")
+            self._log(
+                f"[anomaly] Threshold used: {thr:.3f} | weights (anom={self.anomaly_weight:.2f}, prior={self.rust_prior_weight:.2f})"
+            )
+
+        rust_scores = np.zeros(len(features), dtype=np.float32)
+        rust_scores[valid_indices] = rust_priors_valid  # keep for debugging/visual
 
         return {
+            "mode": "anomaly",
             "segments": segments,
             "features": features,
             "segment_ids": segment_ids,
             "metal_scores": metal_scores,
             "valid_mask": valid,
-            "rust_scores": rust_scores,
+            "rust_scores": rust_scores,          # rust priors
+            "final_scores": final_scores,        # combined score used for decision
             "rust_pred": rust_pred,
-            "score_map": score_map,
+            "score_map": score_map,              # combined score on pixels
             "pred_map": pred_map,
             "crop_mask": final_mask,
             "rust_percentage": pct,
             "threshold_used": thr,
-            "dynamic_gates": dyn_gates,
+            "dynamic_gates": None,
+            "anomaly_threshold": thr,
         }
 
     # ---- Main analysis ----
@@ -761,6 +1148,8 @@ class FastRustDetector:
         metal_mask = None
         crop = None
         metal_mask_crop = None
+        cx = cy = 0
+        cw, ch = original.shape[1], original.shape[0]
 
         if interactive and self.sam_model is not None:
             self._log("Interactive metal segmentation...")
@@ -785,17 +1174,16 @@ class FastRustDetector:
                 cx, cy, cw, ch = x_min, y_min, x_max - x_min, y_max - y_min
 
         if crop is None:
-            self._log("Cropping (robust)...")
+            self._log("No SAM mask; using full image as crop.")
             crop = original
             cx, cy, cw, ch = 0, 0, original.shape[1], original.shape[0]
-            self._log("Robust crop removed - using full image.")
             metal_mask_crop = np.ones(crop.shape[:2], dtype=np.uint8)
 
         timings["crop"] = time.time() - t0
 
         t0 = time.time()
-        self._log(f"Running Analysis (SLIC n={self.n_segments})...")
-        res = self._perform_segmentation_analysis(crop, metal_mask_crop)
+        self._log(f"Running Analysis (mode={self.mode}, SLIC n={self.n_segments})...")
+        res = self._perform_analysis(crop, metal_mask_crop)
         timings["analysis"] = time.time() - t0
 
         full_mask = np.zeros(original.shape[:2], dtype=np.uint8)
@@ -816,21 +1204,22 @@ class FastRustDetector:
             pred_map=res["pred_map"],
             features=res["features"],
             segment_ids=res["segment_ids"],
-            rust_scores=res["rust_scores"],
+            rust_scores=res["rust_scores"],     # heuristic score or rust prior
+            final_scores=res.get("final_scores", res["rust_scores"]),
             rust_pred=res["rust_pred"],
             valid_segments=res["valid_mask"],
             crop_coords=(cx, cy, cw, ch),
             rust_percentage=rust_percentage,
             metal_mask=metal_mask_crop,
             timings=timings,
-            threshold_used=res["threshold_used"],
-            dynamic_gates=res["dynamic_gates"],
+            threshold_used=float(res.get("threshold_used", self.rust_threshold_fallback)),
+            dynamic_gates=res.get("dynamic_gates", None),
+            mode=res.get("mode", self.mode),
         )
 
     # ---- Visualization ----
     @staticmethod
     def _tight_bbox_from_mask(mask_u8: np.ndarray, pad: int = 2) -> Tuple[int, int, int, int]:
-        """Return tight bbox (x1,y1,x2,y2) inside mask image coordinates."""
         ys, xs = np.where(mask_u8 > 0)
         if len(xs) == 0 or len(ys) == 0:
             h, w = mask_u8.shape[:2]
@@ -853,39 +1242,34 @@ class FastRustDetector:
         metal_mask = results.get("metal_mask", np.ones(crop.shape[:2], dtype=np.uint8)).astype(np.uint8)
         score_map = results.get("score_map", np.zeros(crop.shape[:2], dtype=np.float32))
         thr = float(results.get("threshold_used", self.rust_threshold_fallback))
+        mode = results.get("mode", "unknown")
 
-        # ---- Tight crop to metal bbox for subplots 1-5 (no black background) ----
         x1, y1, x2, y2 = self._tight_bbox_from_mask(metal_mask, pad=2)
         crop_t = crop[y1:y2, x1:x2]
         mask_t = metal_mask[y1:y2, x1:x2]
         seg_t = segments[y1:y2, x1:x2]
         score_t = score_map[y1:y2, x1:x2]
 
-        # 1) Metal Input: set non-metal pixels to white (NO black)
         metal_input = crop_t.copy()
         metal_input[mask_t == 0] = 255
 
-        # 2) SLIC boundaries drawn on the same "white background" metal input
         vis_segments = mark_boundaries(cv2.cvtColor(metal_input, cv2.COLOR_BGR2RGB), seg_t)
 
-        # 3) LAB a* (show only metal; outside metal -> neutral 128)
         lab_crop = cv2.cvtColor(crop_t, cv2.COLOR_BGR2Lab)
         lab_a = lab_crop[:, :, 1].copy()
         lab_a[mask_t == 0] = 128
 
-        # 5) Rust-score heatmap inside metal (outside -> 0)
         score_vis = cv2.normalize(score_t, None, 0, 1, cv2.NORM_MINMAX)
         score_vis_rgb = plt.cm.inferno(score_vis)[:, :, :3]
-        score_vis_rgb[mask_t == 0] = 1.0  # white outside metal
+        score_vis_rgb[mask_t == 0] = 1.0
 
-        # 6) Final result stays on full original (as before)
         vis_final = original.copy()
-        vis_final[full_mask == 1] = [0, 0, 255]  # red in BGR
+        vis_final[full_mask == 1] = [0, 0, 255]
         vis_final = cv2.addWeighted(original, 0.6, vis_final, 0.4, 0)
 
         fig, axes = plt.subplots(2, 3, figsize=(16, 9))
         fig.suptitle(
-            f"Fast Rust Detection [PER-SEGMENT] | Segments: {self.n_segments}\n"
+            f"Rust Detection [{mode.upper()}] | Segments: {self.n_segments}\n"
             f"Coverage (Metal): {rust_percentage:.1f}% | Threshold used: {thr:.2f}",
             fontsize=12,
         )
@@ -908,7 +1292,7 @@ class FastRustDetector:
         axes[1, 0].axis("off")
 
         axes[1, 1].imshow(score_vis_rgb)
-        axes[1, 1].set_title("5. Per-Segment Rust Score (Heatmap) [tight]")
+        axes[1, 1].set_title("5. Score Heatmap (per-segment) [tight]")
         axes[1, 1].axis("off")
 
         axes[1, 2].imshow(cv2.cvtColor(vis_final, cv2.COLOR_BGR2RGB))
@@ -928,7 +1312,7 @@ class FastRustDetector:
 
 # ----------------------------- CLI + Main -----------------------------
 def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Fast Rust Detection (per-segment, dynamic thresholds)")
+    p = argparse.ArgumentParser(description="Rust Detection (heuristic OR anomaly detection over segments)")
     p.add_argument("--image", type=str, default="", help="Path to image; if empty, file dialog opens.")
     p.add_argument("--interactive", type=int, default=1, help="1=interactive SAM metal selection; 0=full image.")
     p.add_argument("--sam_checkpoint", type=str, default="sam2.1_b.pt", help="Path to SAM2 checkpoint.")
@@ -936,42 +1320,36 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--fast_mode", type=int, default=0)
     p.add_argument("--verbose", type=int, default=1)
 
+    # Mode
+    p.add_argument(
+        "--mode",
+        type=str,
+        default="anomaly",
+        choices=["anomaly", "heuristic"],
+        help="anomaly = anomaly detection + rust prior, heuristic = original color/texture scoring",
+    )
+
+    # Heuristic settings
     p.add_argument(
         "--rust_threshold_fallback",
         type=float,
         default=0.60,
-        help="Fallback score threshold when dynamic score thresholding is off/insufficient data.",
+        help="Fallback score threshold (heuristic or anomaly fallback).",
     )
-    p.add_argument(
-        "--dynamic_feature_gates",
-        type=int,
-        default=1,
-        help="1=derive feature gates from per-image percentiles (metal segments); 0=use defaults.",
-    )
-    p.add_argument(
-        "--dynamic_score_threshold",
-        type=int,
-        default=1,
-        help="1=derive final score threshold from Otsu on rust scores; 0=use fallback threshold.",
-    )
-    p.add_argument(
-        "--min_valid_segments_for_dynamic",
-        type=int,
-        default=20,
-        help="Minimum number of metal segments required to enable dynamic thresholds.",
-    )
-    p.add_argument(
-        "--ensure_one_positive",
-        type=int,
-        default=1,
-        help="If 1 and nothing passes threshold, mark best-scoring segment as rust.",
-    )
-    p.add_argument(
-        "--otsu_bias",
-        type=float,
-        default=-0.05,
-        help="Bias applied to Otsu-derived threshold (negative => more inclusive).",
-    )
+    p.add_argument("--dynamic_feature_gates", type=int, default=1)
+    p.add_argument("--dynamic_score_threshold", type=int, default=1)
+    p.add_argument("--min_valid_segments_for_dynamic", type=int, default=20)
+    p.add_argument("--ensure_one_positive", type=int, default=1)
+    p.add_argument("--otsu_bias", type=float, default=-0.05)
+
+    # Anomaly settings
+    p.add_argument("--anomaly_weight", type=float, default=0.70)
+    p.add_argument("--rust_prior_weight", type=float, default=0.30)
+    p.add_argument("--anomaly_threshold_mode", type=str, default="otsu", choices=["otsu", "percentile"])
+    p.add_argument("--anomaly_percentile", type=float, default=92.0)
+    p.add_argument("--anomaly_model_path", type=str, default="", help="Path to .npz anomaly model (load/save).")
+    p.add_argument("--clean_dir", type=str, default="", help="Directory of CLEAN images to fit anomaly model.")
+
     return p
 
 
@@ -996,10 +1374,17 @@ def main():
         dynamic_score_threshold=bool(args.dynamic_score_threshold),
         min_valid_segments_for_dynamic=int(args.min_valid_segments_for_dynamic),
         otsu_bias=float(args.otsu_bias),
+        mode=str(args.mode),
+        anomaly_weight=float(args.anomaly_weight),
+        rust_prior_weight=float(args.rust_prior_weight),
+        anomaly_threshold_mode=str(args.anomaly_threshold_mode),
+        anomaly_percentile=float(args.anomaly_percentile),
+        anomaly_model_path=str(args.anomaly_model_path),
+        clean_dir=str(args.clean_dir),
     )
 
     results = detector.analyze(image_path, interactive=bool(args.interactive))
-    out = f"results/{os.path.splitext(os.path.basename(image_path))[0]}_result.png"
+    out = f"results/{os.path.splitext(os.path.basename(image_path))[0]}_{results.get('mode','mode')}_result.png"
     detector.visualize_detection(results, save_path=out)
 
 
