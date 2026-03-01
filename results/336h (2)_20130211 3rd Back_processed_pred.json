@@ -1,0 +1,16 @@
+{
+  "image_path": "C:/Users/Prathamesh Shankar/Desktop/Thesis/WorkingFolder/Easy/Stahl - Cropped/APZ10/(2013) 5082/336 Hrs/336h (2)_20130211 3rd Back.JPG",
+  "output_image": "C:\\Users\\Prathamesh Shankar\\Desktop\\Thesis\\MS Thesis\\Msc_Thesis\\results\\336h (2)_20130211 3rd Back_processed.png",
+  "bbox": [
+    36,
+    370,
+    449,
+    760
+  ],
+  "pred_idx": 1,
+  "pred_label": "rust",
+  "probs": {
+    "clean": 0.4883771538734436,
+    "rust": 0.5116228461265564
+  }
+}

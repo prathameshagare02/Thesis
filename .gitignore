@@ -2,11 +2,6 @@
 __pycache__/
 *.py[codz]
 *$py.class
-data/
-results/
-runs/
-outputs/
-src/
 # C extensions
 *.so
 **sam3.pt
@@ -61,10 +56,6 @@ cover/
 # Translations
 *.mo
 *.pot
-**.JPG
-**.PNG
-**.png
-**.jpg
 # Django stuff:
 *.log
 local_settings.py

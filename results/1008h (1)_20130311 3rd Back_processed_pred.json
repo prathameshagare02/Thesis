@@ -1,0 +1,16 @@
+{
+  "image_path": "C:/Users/Prathamesh Shankar/Desktop/Thesis/WorkingFolder/Easy/Ni-Basis - Cropped/Deloro Alloy 60/(2013) 5070/1008/1008h (1)_20130311 3rd Back.JPG",
+  "output_image": "C:\\Users\\Prathamesh Shankar\\Desktop\\Thesis\\MS Thesis\\Msc_Thesis\\results\\1008h (1)_20130311 3rd Back_processed.png",
+  "bbox": [
+    81,
+    252,
+    449,
+    621
+  ],
+  "pred_idx": 0,
+  "pred_label": "clean",
+  "probs": {
+    "clean": 0.5009176135063171,
+    "rust": 0.49908238649368286
+  }
+}

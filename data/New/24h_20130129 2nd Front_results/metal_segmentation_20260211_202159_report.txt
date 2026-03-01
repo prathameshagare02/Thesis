@@ -1,0 +1,11 @@
+METAL OBJECT SEGMENTATION REPORT
+==================================================
+
+Analysis Date: 2026-02-11 20:21:59
+Original Image: 24h_20130129 2nd Front.JPG
+Image Dimensions: 544 x 1056
+Total Image Area: 574464 pixels
+Metal Area: 160664 pixels
+Background Area: 413800 pixels
+Metal Percentage: 27.97%
+Background Percentage: 72.03%

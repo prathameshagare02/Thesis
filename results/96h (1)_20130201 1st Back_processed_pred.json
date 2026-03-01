@@ -1,0 +1,16 @@
+{
+  "image_path": "C:/Users/Prathamesh Shankar/Desktop/Thesis/WorkingFolder/Test/96h (1)_20130201 1st Back.JPG",
+  "output_image": "C:\\Users\\Prathamesh Shankar\\Desktop\\Thesis\\MS Thesis\\Msc_Thesis\\results\\96h (1)_20130201 1st Back_processed.png",
+  "bbox": [
+    42,
+    359,
+    515,
+    810
+  ],
+  "pred_idx": 1,
+  "pred_label": "rust",
+  "probs": {
+    "clean": 0.4938752353191376,
+    "rust": 0.5061246752738953
+  }
+}
