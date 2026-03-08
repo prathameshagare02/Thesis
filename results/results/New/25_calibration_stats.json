@@ -1,0 +1,24 @@
+{
+  "is_calibrated": true,
+  "calibration_method": "isotonic",
+  "rust_percentage": 18.28658861843398,
+  "metal_box_score": 0.8564479351043701,
+  "raw_probability": {
+    "min": 0.0,
+    "max": 0.9999987483024597,
+    "mean": 0.1649780124425888,
+    "std": 0.3711504340171814
+  },
+  "calibrated_probability": {
+    "min": 0.23458561301231384,
+    "max": 0.9797062277793884,
+    "mean": 0.35750675201416016,
+    "std": 0.27655285596847534
+  },
+  "thresholded_rust_pixels": {
+    "threshold_0.3": 23504,
+    "threshold_0.5": 23504,
+    "threshold_0.7": 23504
+  },
+  "total_pixels": 142476
+}

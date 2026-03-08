@@ -1,0 +1,20 @@
+{
+  "raw_probability": {
+    "mean": 0.4182521104812622,
+    "std": 0.19077475368976593,
+    "min": 0.17611388862133026,
+    "max": 0.6575582027435303,
+    "median": 0.5482180714607239
+  },
+  "calibrated_probability": {
+    "mean": 0.4506649672985077,
+    "std": 0.45261096954345703,
+    "min": 0.0,
+    "max": 1.0,
+    "median": 0.2338843047618866
+  },
+  "kmeans_mask_coverage": 0.4506649616368286,
+  "calibrator_fitted": true,
+  "calibrator_method": "isotonic",
+  "calibrator_n_samples": 195500
+}

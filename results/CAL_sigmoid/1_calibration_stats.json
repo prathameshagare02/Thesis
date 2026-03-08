@@ -1,0 +1,20 @@
+{
+  "raw_probability": {
+    "mean": 0.4182521104812622,
+    "std": 0.19077475368976593,
+    "min": 0.17611388862133026,
+    "max": 0.6575582027435303,
+    "median": 0.5482180714607239
+  },
+  "calibrated_probability": {
+    "mean": 0.45064878463745117,
+    "std": 0.4241214990615845,
+    "min": 5.3971909406980156e-14,
+    "max": 0.9998082518577576,
+    "median": 0.4199282228946686
+  },
+  "kmeans_mask_coverage": 0.4506649616368286,
+  "calibrator_fitted": true,
+  "calibrator_method": "sigmoid",
+  "calibrator_n_samples": 195500
+}

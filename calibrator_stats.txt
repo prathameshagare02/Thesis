@@ -1,0 +1,60 @@
+Calibration Training Statistics
+==================================================
+
+Method: isotonic
+Total samples: 947352
+Overall rust ratio: 0.5000
+Raw ECE: 0.1590
+Calibrated ECE: 0.0000
+Improvement: 0.1590
+
+Per-image statistics:
+--------------------------------------------------
+1.JPG: n=19550, rust=0.500, score_rust=0.540, score_clean=0.010
+10.JPG: n=20592, rust=0.500, score_rust=0.710, score_clean=0.031
+11.JPG: n=10400, rust=0.500, score_rust=0.612, score_clean=0.002
+12.JPG: n=10206, rust=0.500, score_rust=0.676, score_clean=0.034
+13.JPG: n=11178, rust=0.500, score_rust=0.676, score_clean=0.001
+14.JPG: n=18402, rust=0.500, score_rust=0.656, score_clean=0.027
+15.JPG: n=12958, rust=0.500, score_rust=0.641, score_clean=0.001
+16.JPG: n=12282, rust=0.500, score_rust=0.628, score_clean=0.000
+17.JPG: n=13872, rust=0.500, score_rust=0.620, score_clean=0.000
+18.JPG: n=17048, rust=0.500, score_rust=0.912, score_clean=0.045
+19.JPG: n=15584, rust=0.500, score_rust=0.823, score_clean=0.004
+2.JPG: n=18154, rust=0.500, score_rust=0.957, score_clean=0.021
+20.JPG: n=12600, rust=0.500, score_rust=0.973, score_clean=0.000
+21.JPG: n=29888, rust=0.500, score_rust=0.949, score_clean=0.006
+22.JPG: n=24948, rust=0.500, score_rust=0.331, score_clean=0.000
+23.JPG: n=11662, rust=0.500, score_rust=0.991, score_clean=0.001
+24.JPG: n=16358, rust=0.500, score_rust=0.734, score_clean=0.007
+25.JPG: n=14246, rust=0.500, score_rust=0.889, score_clean=0.005
+26.JPG: n=19130, rust=0.500, score_rust=0.959, score_clean=0.012
+27.JPG: n=14246, rust=0.500, score_rust=0.884, score_clean=0.005
+28.JPG: n=16074, rust=0.500, score_rust=0.813, score_clean=0.154
+29.JPG: n=19248, rust=0.500, score_rust=0.751, score_clean=0.059
+3.JPG: n=19964, rust=0.500, score_rust=0.569, score_clean=0.015
+30.JPG: n=14022, rust=0.500, score_rust=0.666, score_clean=0.005
+31.JPG: n=17798, rust=0.500, score_rust=0.991, score_clean=0.035
+32.JPG: n=19928, rust=0.500, score_rust=0.982, score_clean=0.038
+33.JPG: n=15680, rust=0.500, score_rust=0.778, score_clean=0.011
+34.JPG: n=19492, rust=0.500, score_rust=0.575, score_clean=0.010
+35.JPG: n=20072, rust=0.500, score_rust=0.705, score_clean=0.006
+36.JPG: n=16400, rust=0.500, score_rust=0.546, score_clean=0.015
+37.JPG: n=19480, rust=0.500, score_rust=0.751, score_clean=0.037
+38.JPG: n=17056, rust=0.500, score_rust=0.885, score_clean=0.002
+39.JPG: n=13358, rust=0.500, score_rust=0.697, score_clean=0.002
+4.JPG: n=13834, rust=0.500, score_rust=0.000, score_clean=0.000
+40.JPG: n=15592, rust=0.500, score_rust=0.998, score_clean=0.050
+41.JPG: n=16606, rust=0.500, score_rust=0.888, score_clean=0.000
+42.JPG: n=13688, rust=0.500, score_rust=0.773, score_clean=0.001
+43.JPG: n=17046, rust=0.500, score_rust=0.876, score_clean=0.040
+44.JPG: n=50756, rust=0.500, score_rust=0.669, score_clean=0.000
+45.JPG: n=66628, rust=0.500, score_rust=0.498, score_clean=0.002
+46.JPG: n=30414, rust=0.500, score_rust=0.292, score_clean=0.000
+47.JPG: n=32432, rust=0.500, score_rust=0.580, score_clean=0.005
+48.JPG: n=31248, rust=0.500, score_rust=0.580, score_clean=0.003
+49.JPG: n=18786, rust=0.500, score_rust=0.950, score_clean=0.037
+5.JPG: n=33350, rust=0.500, score_rust=0.716, score_clean=0.017
+50.JPG: n=15898, rust=0.500, score_rust=0.709, score_clean=0.005
+51.JPG: n=19580, rust=0.500, score_rust=0.387, score_clean=0.059
+52.JPG: n=19618, rust=0.500, score_rust=0.836, score_clean=0.022

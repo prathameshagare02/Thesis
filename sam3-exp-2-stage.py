@@ -5,6 +5,7 @@ import argparse
 import os
 import time
 import tempfile
+import pickle
 
 import cv2
 import matplotlib.pyplot as plt
@@ -80,7 +81,8 @@ class FastRustDetector:
         # Prompts
         metal_prompt: str = "metal",
         clean_prompt: str = "clean shiny metal",
-        rust_prompt: str = "rusty metal",
+        rust_prompt: str = "rusted area",
+        rust_prompts: Optional[List[str]] = None,  # Multiple prompts for detecting different rust types
         # KMeans
         kmeans_k: int = 2,
         kmeans_attempts: int = 5,
@@ -89,14 +91,27 @@ class FastRustDetector:
         kmeans_train_samples: int = 80000,
         # Behavior
         ensure_one_positive: bool = True,
+        # Probability-based mask (for consistency with probability maps)
+        use_probability_mask: bool = False,
+        probability_threshold: float = 0.5,
     ):
         self.verbose = bool(verbose)
         self.sam_checkpoint = sam_checkpoint
         self.roi_pad = int(roi_pad)
+        
+        # Use probability threshold instead of KMeans for final mask
+        self.use_probability_mask = bool(use_probability_mask)
+        self.probability_threshold = float(probability_threshold)
 
         self.prompt_metal = str(metal_prompt)
         self.prompt_clean = str(clean_prompt)
         self.prompt_rust = str(rust_prompt)
+        
+        # Support multiple rust prompts for detecting light + heavy rust
+        if rust_prompts:
+            self.rust_prompts = list(rust_prompts)
+        else:
+            self.rust_prompts = [self.prompt_rust]  # Default: single prompt
 
         self.kmeans_k = max(2, int(kmeans_k))
         self.kmeans_attempts = max(1, int(kmeans_attempts))
@@ -135,10 +150,16 @@ class FastRustDetector:
         print(f"  SAM3 checkpoint: {self.sam_checkpoint}")
         print(f"  ROI padding: {self.roi_pad}px")
         print(f"  Torch device: {getattr(self, 'device', 'unknown')}")
-        print(f"  Prompts: metal={self.prompt_metal!r}, clean={self.prompt_clean!r}, rust={self.prompt_rust!r}")
+        print(f"  Prompts: metal={self.prompt_metal!r}, clean={self.prompt_clean!r}")
+        if len(self.rust_prompts) > 1:
+            print(f"  Rust prompts ({len(self.rust_prompts)}): {self.rust_prompts}")
+        else:
+            print(f"  Rust prompt: {self.rust_prompts[0]!r}")
         print(f"  KMeans: K={self.kmeans_k}, attempts={self.kmeans_attempts}, max_iter={self.kmeans_max_iter}")
         print(f"  KMeans train samples: {self.kmeans_train_samples}")
         print(f"  Ensure one positive: {self.ensure_one_positive}")
+        if self.use_probability_mask:
+            print(f"  Probability mask: threshold={self.probability_threshold}")
 
     # ---- SAM3 ----
     def load_sam3_model(self):
@@ -523,7 +544,7 @@ class FastRustDetector:
                 num_detections=0,
             )
 
-    # ---- Per-pixel features (ROI only, pass2 evidence only) ----
+    # ---- Per-pixel features (ROI only, SAM3 evidence only) ----
     def _compute_pixel_feature_tensor(
         self,
         crop: np.ndarray,
@@ -532,45 +553,9 @@ class FastRustDetector:
     ) -> Tuple[np.ndarray, List[str]]:
         """
         Per-pixel feature tensor for the ROI.
-        Uses:
-          - ROI image features
-          - PASS #2 SAM3 evidence channels (clean/rust)
-        Does NOT use pass #1 metal mask/features.
+        Uses ONLY SAM3 evidence channels (clean/rust).
+        No color or texture features.
         """
-        lab = cv2.cvtColor(crop, cv2.COLOR_BGR2Lab).astype(np.float32)
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV).astype(np.float32)
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
-
-        sobelx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-        sobely = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-        grad = np.sqrt(sobelx**2 + sobely**2)
-
-        k = 5
-        local_mean = cv2.blur(gray, (k, k))
-        local_sq_mean = cv2.blur(gray**2, (k, k))
-        local_std = np.sqrt(np.maximum(local_sq_mean - local_mean**2, 0.0))
-
-        # Normalized image features
-        L_norm = (lab[:, :, 0] / 255.0).astype(np.float32)
-        a_norm = (lab[:, :, 1] / 255.0).astype(np.float32)
-        b_norm = (lab[:, :, 2] / 255.0).astype(np.float32)
-
-        H_norm = (hsv[:, :, 0] / 179.0).astype(np.float32)
-        S_norm = (hsv[:, :, 1] / 255.0).astype(np.float32)
-        V_norm = (hsv[:, :, 2] / 255.0).astype(np.float32)
-
-        grad_norm = self._norm_percentile(grad, q=99.0)
-        texture_norm = self._norm_percentile(local_std, q=99.0)
-
-        a_centered = lab[:, :, 1] - 128.0
-        b_centered = lab[:, :, 2] - 128.0
-        chroma = np.sqrt(a_centered**2 + b_centered**2).astype(np.float32)
-        chroma_norm = self._norm_percentile(chroma, q=99.0)
-
-        # Rust-oriented color priors
-        redness = np.clip((a_centered + 10.0) / 80.0, 0.0, 1.0).astype(np.float32)
-        brownness = np.clip((0.6 * a_centered + 0.8 * b_centered + 20.0) / 120.0, 0.0, 1.0).astype(np.float32)
-
         # PASS #2 SAM3 evidence channels only
         clean_ev = np.clip(clean_evidence.astype(np.float32), 0.0, 1.0)
         rust_ev = np.clip(rust_evidence.astype(np.float32), 0.0, 1.0)
@@ -580,17 +565,6 @@ class FastRustDetector:
 
         features = np.stack(
             [
-                L_norm,
-                a_norm,
-                b_norm,
-                H_norm,
-                S_norm,
-                V_norm,
-                grad_norm,
-                texture_norm,
-                chroma_norm,
-                redness,
-                brownness,
                 clean_ev,
                 rust_ev,
                 ev_union,
@@ -601,17 +575,6 @@ class FastRustDetector:
         ).astype(np.float32)
 
         feature_names = [
-            "L_norm",
-            "a_norm",
-            "b_norm",
-            "H_norm",
-            "S_norm",
-            "V_norm",
-            "grad_norm",
-            "texture_norm",
-            "chroma_norm",
-            "redness",
-            "brownness",
             "sam2_clean_evidence",
             "sam2_rust_evidence",
             "sam2_union_evidence",
@@ -700,7 +663,7 @@ class FastRustDetector:
         d2 = ((X[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
         labels_all = np.argmin(d2, axis=1).astype(np.int16)
 
-        # Prompt-guided rust cluster selection (uses pass2 evidence only)
+        # Prompt-guided rust cluster selection (SAM3 evidence only)
         idx = {name: i for i, name in enumerate(feature_names)}
         cluster_scores: Dict[int, float] = {}
 
@@ -712,15 +675,11 @@ class FastRustDetector:
 
             meanv = X_raw[m].mean(axis=0)
 
+            # Score based purely on SAM3 evidence
             score = (
-                2.8 * float(meanv[idx["sam2_rust_evidence"]])
-                - 2.2 * float(meanv[idx["sam2_clean_evidence"]])
-                + 0.45 * float(meanv[idx["redness"]])
-                + 0.40 * float(meanv[idx["brownness"]])
-                + 0.18 * float(meanv[idx["texture_norm"]])
-                + 0.10 * float(meanv[idx["grad_norm"]])
-                + 0.10 * float(meanv[idx["S_norm"]])
-                - 0.05 * float(meanv[idx["V_norm"]])
+                3.0 * float(meanv[idx["sam2_rust_evidence"]])
+                - 2.5 * float(meanv[idx["sam2_clean_evidence"]])
+                + 1.0 * float(meanv[idx["sam2_rust_minus_clean"]])
             )
             cluster_scores[c] = float(score)
 
@@ -733,55 +692,30 @@ class FastRustDetector:
 
         rust_pred = (labels_all == rust_cluster_id).astype(np.uint8)
 
-        # Light refinement (pass2 evidence + color only)
+        # Refinement based purely on SAM3 evidence
         rust_i = idx["sam2_rust_evidence"]
         clean_i = idx["sam2_clean_evidence"]
         delta_i = idx["sam2_rust_minus_clean"]
-        redness_i = idx["redness"]
-        brown_i = idx["brownness"]
-        a_i = idx["a_norm"]
-        b_i = idx["b_norm"]
-        S_i = idx["S_norm"]
-        H_i = idx["H_norm"]
-        chroma_i = idx["chroma_norm"]
-        L_i = idx["L_norm"]
 
-        # Exclude blue/cyan background pixels more aggressively
-        # Blue/cyan characteristics in 12.JPG:
-        # - a_norm: mean=0.513, max=0.592
-        # - b_norm: mean=0.377, max=0.475
-        # - H_norm: mean=0.603 (blue-cyan range ~0.45-0.75)
-        # Blue is characterized by being in the blue hue range with low b*
-        is_blue_background = (
-            (X_raw[:, b_i] < 0.50) &                 # low b* (blue direction in Lab)
-            (X_raw[:, H_i] > 0.45) & (X_raw[:, H_i] < 0.75)  # hue in blue-cyan range
-        )
-
-        support = (
-            (X_raw[:, rust_i] >= (X_raw[:, clean_i] - 0.02))
-            | (X_raw[:, delta_i] > -0.02)
-            | ((X_raw[:, redness_i] > 0.55) & (X_raw[:, brown_i] > 0.45))
-        )
+        # CRITICAL: Only mark as rust if SAM3 actually detected rust evidence
+        # Minimum rust evidence threshold to avoid false positives on background/reflections
+        min_rust_evidence = 0.05
+        has_rust_evidence = X_raw[:, rust_i] >= min_rust_evidence
+        
+        # Also require rust evidence >= clean evidence (with small margin)
+        rust_dominates = X_raw[:, rust_i] >= (X_raw[:, clean_i] - 0.05)
+        
+        # Combined: must have minimum rust evidence AND rust must dominate
+        support = has_rust_evidence & rust_dominates
         rust_pred = (rust_pred & support.astype(np.uint8)).astype(np.uint8)
-        
-        # Directly mask out blue background pixels from rust prediction
-        rust_pred = rust_pred & (~is_blue_background).astype(np.uint8)
-        
-        # Require minimum color evidence for rust
-        # 12.JPG non-rust has redness=0.123, brownness=0.190
-        # 1.JPG rust has redness=0.278 mean (10th percentile=0.100)
-        # Use higher thresholds to filter more strictly
-        has_rust_color = (X_raw[:, redness_i] > 0.12) | (X_raw[:, brown_i] > 0.20)
-        rust_pred = rust_pred & has_rust_color.astype(np.uint8)
 
         if self.ensure_one_positive and int(rust_pred.sum()) == 0 and n > 0:
-            rank = (
-                2.0 * X_raw[:, rust_i]
-                - 1.5 * X_raw[:, clean_i]
-                + 0.5 * X_raw[:, redness_i]
-                + 0.4 * X_raw[:, brown_i]
-            )
-            rust_pred[int(np.argmax(rank))] = 1
+            # Fallback: only pick pixel with highest rust evidence IF rust_ev > min threshold
+            max_rust_ev = float(X_raw[:, rust_i].max())
+            if max_rust_ev >= min_rust_evidence:
+                rank = X_raw[:, rust_i] - X_raw[:, clean_i]
+                rust_pred[int(np.argmax(rank))] = 1
+            # Otherwise, don't force any rust detection (no rust found by SAM3)
 
         cluster_map = labels_all.reshape(h, w).astype(np.int16)
         rust_mask = rust_pred.reshape(h, w).astype(np.uint8)
@@ -815,13 +749,25 @@ class FastRustDetector:
         clean_out = self._sam3_prompt_evidence_map(crop, self.prompt_clean, expected_hw=(h, w))
         self._log(f"  → Clean prompt done in {time.time() - t0:.3f}s")
 
-        self._log(f"SAM3 pass #2 (whole ROI) prompt={self.prompt_rust!r}")
+        # Run multiple rust prompts and combine evidence (max pooling)
+        rust_ev = np.zeros((h, w), dtype=np.float32)
+        rust_num_dets_total = 0
+        rust_best_score = 0.0
+        rust_best_mask = np.zeros((h, w), dtype=np.uint8)
+        
         t0 = time.time()
-        rust_out = self._sam3_prompt_evidence_map(crop, self.prompt_rust, expected_hw=(h, w))
-        self._log(f"  → Rust prompt done in {time.time() - t0:.3f}s")
+        for i, rust_prompt in enumerate(self.rust_prompts):
+            self._log(f"SAM3 pass #2 rust prompt {i+1}/{len(self.rust_prompts)}: {rust_prompt!r}")
+            rust_out = self._sam3_prompt_evidence_map(crop, rust_prompt, expected_hw=(h, w))
+            # Combine evidence maps using max (union of all rust detections)
+            rust_ev = np.maximum(rust_ev, rust_out["evidence_map"])
+            rust_num_dets_total += rust_out["num_detections"]
+            if rust_out["best_score"] > rust_best_score:
+                rust_best_score = rust_out["best_score"]
+                rust_best_mask = rust_out["best_mask"]
+        self._log(f"  → All {len(self.rust_prompts)} rust prompt(s) done in {time.time() - t0:.3f}s")
 
         clean_ev = clean_out["evidence_map"]
-        rust_ev = rust_out["evidence_map"]
 
         t0 = time.time()
         feature_tensor, feature_names = self._compute_pixel_feature_tensor(crop, clean_ev, rust_ev)
@@ -838,8 +784,22 @@ class FastRustDetector:
         total_pixels_box = int(h * w)
         rust_pct_box = (100.0 * rust_pixels / total_pixels_box) if total_pixels_box > 0 else 0.0
 
+        # Compute raw rust probability (ratio method)
+        raw_rust_prob = (rust_ev / (rust_ev + clean_ev + 1e-6)).astype(np.float32)
+        
+        # Option to use probability-based mask for consistency with probability maps
+        if self.use_probability_mask:
+            rust_mask_roi = (raw_rust_prob >= self.probability_threshold).astype(np.uint8)
+            # Apply morphological cleaning
+            kernel = np.ones((3, 3), np.uint8)
+            rust_mask_roi = cv2.morphologyEx(rust_mask_roi, cv2.MORPH_OPEN, kernel)
+            rust_mask_roi = cv2.morphologyEx(rust_mask_roi, cv2.MORPH_CLOSE, kernel)
+            rust_pixels = int(rust_mask_roi.sum())
+            rust_pct_box = (100.0 * rust_pixels / total_pixels_box) if total_pixels_box > 0 else 0.0
+            self._log(f"Using probability-based mask (threshold={self.probability_threshold:.2f})")
+        
         # diagnostic score map
-        score_map = np.clip(0.5 + 0.5 * (rust_ev - clean_ev), 0.0, 1.0).astype(np.float32)
+        score_map = np.clip(raw_rust_prob, 0.0, 1.0).astype(np.float32)
 
         self._log(f"ROI pixels={total_pixels_box}, rust={rust_pixels} ({rust_pct_box:.2f}% of ROI box)")
 
@@ -847,11 +807,11 @@ class FastRustDetector:
             sam_clean_evidence=clean_ev,
             sam_rust_evidence=rust_ev,
             sam_clean_best_mask=clean_out["best_mask"],
-            sam_rust_best_mask=rust_out["best_mask"],
+            sam_rust_best_mask=rust_best_mask,
             sam_clean_best_score=float(clean_out["best_score"]),
-            sam_rust_best_score=float(rust_out["best_score"]),
+            sam_rust_best_score=float(rust_best_score),
             sam_clean_num_dets=int(clean_out["num_detections"]),
-            sam_rust_num_dets=int(rust_out["num_detections"]),
+            sam_rust_num_dets=int(rust_num_dets_total),
             pixel_feature_tensor=feature_tensor,      # HxWxF
             pixel_feature_names=feature_names,        # len F
             valid_mask=np.ones((h, w), dtype=np.uint8),  # whole ROI is valid by design
@@ -863,6 +823,8 @@ class FastRustDetector:
             score_map=score_map,
             rust_percentage_box=rust_pct_box,
             kmeans_meta=km,
+            # Probability outputs
+            rust_probability=raw_rust_prob,
         )
 
     # ---- Main analysis ----
@@ -963,6 +925,8 @@ class FastRustDetector:
             clean_cluster_id=res["clean_cluster_id"],
             cluster_scores=res["cluster_scores"],
             kmeans_meta=res["kmeans_meta"],
+            # Probability outputs
+            rust_probability=res["rust_probability"],
         )
 
     # ---- Visualization ----
@@ -977,8 +941,10 @@ class FastRustDetector:
         cluster_map = results["cluster_map"]
         rust_cluster_id = int(results["rust_cluster_id"])
         clean_cluster_id = int(results["clean_cluster_id"])
+        rust_probability = results.get("rust_probability", None)
 
         (bx1, by1, bx2, by2) = results["metal_box_full"]
+        crop_coords = results["crop_coords"]  # (x, y, w, h)
         bscore = float(results["metal_box_score"])
         rust_percentage = float(results["rust_percentage"])
 
@@ -1008,47 +974,108 @@ class FastRustDetector:
         ev_vis[:, :, 2] = np.clip(rust_ev * 255.0, 0, 255).astype(np.uint8)   # red
         stage4 = cv2.addWeighted(stage4, 0.6, ev_vis, 0.5, 0)
 
-        # Stage 5: KMeans clusters + final rust mask in ROI
-        stage5 = crop.copy()
-        km_overlay = stage5.copy()
+        # Stage 5: Per-pixel rust probability heatmap (ROI)
+        if rust_probability is not None:
+            # Create heatmap colormap: blue (low prob) -> red (high prob)
+            prob_normalized = np.clip(rust_probability, 0.0, 1.0)
+            prob_heatmap = cv2.applyColorMap(
+                (prob_normalized * 255).astype(np.uint8),
+                cv2.COLORMAP_JET
+            )
+            stage5 = prob_heatmap
+        else:
+            # Fallback: compute from evidence
+            prob_fallback = rust_ev / (rust_ev + clean_ev + 1e-6)
+            prob_heatmap = cv2.applyColorMap(
+                (np.clip(prob_fallback, 0.0, 1.0) * 255).astype(np.uint8),
+                cv2.COLORMAP_JET
+            )
+            stage5 = prob_heatmap
+
+        # Stage 6: KMeans clusters visualization (only where SAM3 has evidence)
+        stage6 = crop.copy()
+        km_overlay = stage6.copy()
+        
+        # Only show cluster colors where SAM3 detected something (clean OR rust evidence)
+        min_evidence = 0.05
+        has_evidence = (clean_ev >= min_evidence) | (rust_ev >= min_evidence)
+        
         if clean_cluster_id >= 0:
-            km_overlay[(cluster_map == clean_cluster_id)] = [0, 255, 0]  # green
+            clean_mask = (cluster_map == clean_cluster_id) & has_evidence
+            km_overlay[clean_mask] = [0, 255, 0]  # green
         if rust_cluster_id >= 0:
-            km_overlay[(cluster_map == rust_cluster_id)] = [0, 0, 255]   # red
-        stage5 = cv2.addWeighted(stage5, 0.55, km_overlay, 0.45, 0)
+            rust_mask = (cluster_map == rust_cluster_id) & has_evidence
+            km_overlay[rust_mask] = [0, 0, 255]   # red
+        stage6 = cv2.addWeighted(stage6, 0.55, km_overlay, 0.45, 0)
 
-        rust_overlay_roi = stage5.copy()
-        rust_overlay_roi[crop_mask == 1] = [0, 0, 255]
-        stage5 = cv2.addWeighted(stage5, 0.7, rust_overlay_roi, 0.4, 0)
+        # Stage 7: Binary rust mask (ROI) - white = rust, black = clean
+        rust_mask_vis = np.zeros_like(crop, dtype=np.uint8)
+        rust_mask_vis[crop_mask == 1] = [255, 255, 255]  # white for rust
+        # Add red tint for better visibility
+        rust_mask_colored = crop.copy()
+        rust_mask_colored[crop_mask == 1] = [0, 0, 255]  # red overlay
+        stage7 = cv2.addWeighted(crop, 0.4, rust_mask_colored, 0.6, 0)
 
-        # Stage 6: final overlay on full image
-        stage6 = original.copy()
-        rust_overlay_full = stage6.copy()
+        # Stage 8: Final overlay on full image with rust mask
+        stage8 = original.copy()
+        rust_overlay_full = stage8.copy()
         rust_overlay_full[full_mask == 1] = [0, 0, 255]
-        stage6 = cv2.addWeighted(stage6, 0.6, rust_overlay_full, 0.4, 0)
-        cv2.rectangle(stage6, (bx1, by1), (bx2, by2), (255, 0, 0), 2)
+        stage8 = cv2.addWeighted(stage8, 0.6, rust_overlay_full, 0.4, 0)
+        cv2.rectangle(stage8, (bx1, by1), (bx2, by2), (255, 0, 0), 2)
+        # Add rust percentage text on final image
+        cv2.putText(
+            stage8,
+            f"Rust: {rust_percentage:.1f}%",
+            (bx1, by2 + 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 255),
+            2,
+        )
 
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        fig, axes = plt.subplots(2, 4, figsize=(24, 10))
+        
+        # Calculate mean rust probability
+        if rust_probability is not None:
+            mean_rust_prob = float(np.mean(rust_probability))
+        else:
+            mean_rust_prob = float(np.mean(rust_ev / (rust_ev + clean_ev + 1e-6)))
+        
         fig.suptitle(
             "Rust Detection Stages (SAM3 pass1 crop-only -> SAM3 pass2 clean/rust on whole ROI -> per-pixel KMeans)\n"
-            f"Metal box score={bscore:.2f} | Coverage within ROI box={rust_percentage:.1f}%",
+            f"Metal box score={bscore:.2f} | Coverage={rust_percentage:.1f}% | Mean P(rust)={mean_rust_prob:.3f}",
             fontsize=12,
         )
 
-        imgs = [stage1, stage2, stage3, stage4, stage5, stage6]
+        imgs = [stage1, stage2, stage3, stage4, None, stage6, stage7, stage8]  # stage5 handled separately
         titles = [
             "1) Input image",
-            "2) Input + best metal box (SAM3 pass #1, crop only)",
-            "3) Cropped ROI (whole max-score box only)",
-            "4) SAM3 pass #2 evidence on whole ROI (clean=green, rust=red)",
-            "5) KMeans pixel clusters in ROI + final rust mask",
-            "6) Final rust overlay on input (red) + box",
+            "2) Input + best metal box (SAM3 pass #1)",
+            "3) Cropped ROI",
+            "4) SAM3 evidence (clean=green, rust=red)",
+            f"5) Per-pixel rust probability (mean={mean_rust_prob:.3f})",
+            "6) KMeans clusters (green=clean, red=rust)",
+            "7) Final rust mask (ROI)",
+            "8) Final rust overlay on full image",
         ]
 
         for ax, img, title in zip(axes.ravel(), imgs, titles):
-            ax.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            if img is not None:
+                ax.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
             ax.set_title(title)
             ax.axis("off")
+        
+        # Special handling for probability heatmap with colorbar
+        ax5 = axes.ravel()[4]
+        if rust_probability is not None:
+            prob_normalized = np.clip(rust_probability, 0.0, 1.0)
+        else:
+            prob_normalized = np.clip(rust_ev / (rust_ev + clean_ev + 1e-6), 0.0, 1.0)
+        im5 = ax5.imshow(prob_normalized, cmap='jet', vmin=0.0, vmax=1.0)
+        cbar = fig.colorbar(im5, ax=ax5, fraction=0.046, pad=0.04)
+        cbar.set_label('P(rust)', fontsize=10)
+        cbar.set_ticks([0.0, 0.25, 0.5, 0.75, 1.0])
+        cbar.set_ticklabels(['0.0', '0.25', '0.5', '0.75', '1.0'])
 
         plt.tight_layout()
 
@@ -1081,7 +1108,10 @@ def build_argparser() -> argparse.ArgumentParser:
     # Prompts
     p.add_argument("--prompt_metal", type=str, default="metal", help="SAM3 prompt for pass #1 ROI extraction.")
     p.add_argument("--prompt_clean", type=str, default="clean shiny metal", help="SAM3 prompt for pass #2 clean evidence.")
-    p.add_argument("--prompt_rust", type=str, default="rusty metal", help="SAM3 prompt for pass #2 rust evidence.")
+    p.add_argument("--prompt_rust", type=str, default="rusted area", help="SAM3 prompt for pass #2 rust evidence (single prompt).")
+    p.add_argument("--rust_prompts", type=str, default="",
+                   help="Comma-separated list of rust prompts for detecting different rust types. "
+                        "Example: 'rusted area,oxidized metal,rust spots'. Takes precedence over --prompt_rust.")
 
     # KMeans
     p.add_argument("--kmeans_k", type=int, default=2, help="Number of clusters for pixel KMeans (recommended=2).")
@@ -1101,8 +1131,14 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # Outputs
     p.add_argument("--save_features", type=int, default=0, help="Save per-pixel feature tensor and maps as .npz")
-    p.add_argument("--res_dir", type=str, default="NewTh")
+    p.add_argument("--res_dir", type=str, default="DEBUG")
     p.add_argument("--no_show", action="store_true", help="Don't show matplotlib window (for batch processing)")
+    
+    # Probability-based mask (for consistent visualization)
+    p.add_argument("--use_probability_mask", type=int, default=0, 
+                   help="Use probability threshold for rust mask instead of KMeans (makes mask consistent with probability maps)")
+    p.add_argument("--probability_threshold", type=float, default=0.5,
+                   help="Threshold for probability-based mask (pixels with P(rust) >= threshold are marked as rust)")
     return p
 
 
@@ -1123,12 +1159,15 @@ def main():
         metal_prompt=args.prompt_metal,
         clean_prompt=args.prompt_clean,
         rust_prompt=args.prompt_rust,
+        rust_prompts=[p.strip() for p in args.rust_prompts.split(',') if p.strip()] if args.rust_prompts else None,
         kmeans_k=int(args.kmeans_k),
         kmeans_attempts=int(args.kmeans_attempts),
         kmeans_max_iter=int(args.kmeans_max_iter),
         kmeans_eps=float(args.kmeans_eps),
         kmeans_train_samples=int(args.kmeans_train_samples),
         ensure_one_positive=bool(args.ensure_one_positive),
+        use_probability_mask=bool(args.use_probability_mask),
+        probability_threshold=float(args.probability_threshold),
     )
 
     results = detector.analyze(image_path, interactive=bool(args.interactive))
@@ -1179,6 +1218,7 @@ def main():
         print(f"Feature tensor shape (H, W, F): {results['pixel_feature_tensor'].shape}")
         print(f"Feature names: {results['pixel_feature_names']}")
         print("CONFIRMED: pass #1 only crops ROI; pass #2 runs on the whole cropped ROI box.")
+
 
 if __name__ == "__main__":
     main()

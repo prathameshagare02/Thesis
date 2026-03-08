@@ -1101,7 +1101,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # Outputs
     p.add_argument("--save_features", type=int, default=0, help="Save per-pixel feature tensor and maps as .npz")
-    p.add_argument("--res_dir", type=str, default="NewTh")
+    p.add_argument("--res_dir", type=str, default="DEBUG")
     p.add_argument("--no_show", action="store_true", help="Don't show matplotlib window (for batch processing)")
     return p
 
