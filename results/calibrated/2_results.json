@@ -1,0 +1,10 @@
+{
+  "image": "data/New/2.JPG",
+  "rust_percentage": 12.236798128342246,
+  "rust_pixels": 70296,
+  "total_pixels": 574464,
+  "mean_raw_prob": 0.10072015225887299,
+  "mean_calibrated_prob": 0.523469090461731,
+  "calibration_a": 1.0,
+  "calibration_b": 0.0
+}

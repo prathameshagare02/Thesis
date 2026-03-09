@@ -1,0 +1,18 @@
+{
+  "image": "data/New/6.JPG",
+  "rust_percentage": 5.204,
+  "rust_pixels": 39030,
+  "total_pixels": 750000,
+  "threshold": 0.4,
+  "prompts": {
+    "clean": "clean shiny metal",
+    "rust": [
+      "rust",
+      "rusted area",
+      "brown stain",
+      "oxidation",
+      "corrosion"
+    ],
+    "background": "background"
+  }
+}
