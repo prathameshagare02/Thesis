@@ -27,7 +27,6 @@ class MetalSegmenter:
         self.processed_mask = None     # mask after morphology
         self.model = None              # SAM model
         self.image_path = None
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # morphology parameters
         self.kernel_size = 5
@@ -44,6 +43,14 @@ class MetalSegmenter:
 
         # t-SNE outputs (2D only)
         self.embeddings_2d = None
+
+        # Device selection: prefer CUDA > MPS (Apple Silicon) > CPU
+        if torch.cuda.is_available():
+            self.device = "cuda"
+        elif torch.backends.mps.is_available():
+            self.device = "mps"
+        else:
+            self.device = "cpu"
 
         print(f"Using device: {self.device}")
         self.load_sam2_model()

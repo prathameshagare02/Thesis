@@ -11,7 +11,17 @@ import numpy as np
 from scipy import ndimage
 from skimage.segmentation import slic
 from skimage.util import img_as_float
+import torch
 from ultralytics import SAM
+
+
+def get_device() -> str:
+    """Detect the best available device (MPS for Apple Silicon, CUDA, or CPU)."""
+    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        return "mps"
+    elif torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 # ----------------------------- Optional deps -----------------------------
 try:
@@ -84,6 +94,7 @@ class FastRustDetector:
         dynamic_score_threshold: bool = True,
         min_valid_segments_for_dynamic: int = 20,
         otsu_bias: float = -0.02,
+        device: str | None = None,
     ):
         self.n_segments = int(n_segments)
         self.fast_mode = bool(fast_mode)
@@ -96,6 +107,9 @@ class FastRustDetector:
         self.dynamic_score_threshold = bool(dynamic_score_threshold)
         self.min_valid_segments_for_dynamic = int(min_valid_segments_for_dynamic)
         self.otsu_bias = float(otsu_bias)
+
+        # Device selection (Apple Silicon MPS, CUDA, or CPU)
+        self.device = device if device else get_device()
 
         # SAM
         self.sam_checkpoint = sam_checkpoint
@@ -121,6 +135,7 @@ class FastRustDetector:
 
     def _print_backend_info(self):
         print("FastRustDetector initialized:")
+        print(f"  Device: {self.device.upper()}" + (" (Apple Silicon GPU)" if self.device == "mps" else ""))
         print("  Mode: PER-SEGMENT feature vectors (no clustering)")
         print(f"  Target segments: {self.n_segments}")
         print(f"  Fast mode: {self.fast_mode}")
@@ -134,9 +149,11 @@ class FastRustDetector:
     # ---- SAM ----
     def load_sam2_model(self):
         try:
-            self._log(f"Loading SAM2 model from {self.sam_checkpoint}...")
+            self._log(f"Loading SAM2 model from {self.sam_checkpoint} on {self.device.upper()}...")
             self.sam_model = SAM(self.sam_checkpoint)
-            self._log("SAM2 model loaded successfully.")
+            # Move model to the selected device (MPS for Apple Silicon)
+            self.sam_model.to(self.device)
+            self._log(f"SAM2 model loaded successfully on {self.device.upper()}.")
         except Exception as e:
             self._log(f"Failed to load SAM2 model: {e}")
             self.sam_model = None
@@ -213,7 +230,9 @@ class FastRustDetector:
 
         try:
             image_rgb = cv2.cvtColor(target_img, cv2.COLOR_BGR2RGB)
-            results = self.sam_model.predict(image_rgb, points=list(points), labels=list(labels))
+            results = self.sam_model.predict(
+                image_rgb, points=list(points), labels=list(labels), device=self.device
+            )
 
             if results and results[0].masks is not None and len(results[0].masks.data) > 0:
                 mask = results[0].masks.data[0].cpu().numpy()
@@ -775,7 +794,7 @@ class FastRustDetector:
         y2 = min(h, y2 + pad)
         return x1, y1, x2, y2
 
-    def visualize_detection(self, results: Dict, save_path: str | None = None) -> plt.Figure:
+    def visualize_detection(self, results: Dict, save_path: str | None = None, show: bool = True) -> plt.Figure:
         """
         Shows ONLY:
           1) Metal Input (tight crop, non-metal -> white)
@@ -818,7 +837,8 @@ class FastRustDetector:
         axes[1].axis("off")
 
         plt.tight_layout()
-        plt.show()
+        if show:
+            plt.show()
 
         if save_path:
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -874,6 +894,12 @@ def build_argparser() -> argparse.ArgumentParser:
         default=-0.02,
         help="Bias applied to Otsu-derived threshold (negative => more inclusive).",
     )
+    p.add_argument(
+        "--show",
+        type=int,
+        default=1,
+        help="1=display visualization window; 0=only save to file.",
+    )
     return p
 
 
@@ -901,8 +927,8 @@ def main():
     )
 
     results = detector.analyze(image_path, interactive=bool(args.interactive))
-    out = f"results/New/{os.path.splitext(os.path.basename(image_path))[0]}_result.png"
-    detector.visualize_detection(results, save_path=out)
+    out = f"results/SLIC/{os.path.splitext(os.path.basename(image_path))[0]}_result.png"
+    detector.visualize_detection(results, save_path=out, show=bool(args.show))
 
 
 if __name__ == "__main__":
